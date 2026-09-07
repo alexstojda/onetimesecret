@@ -1,4 +1,7 @@
+// src/schemas/errors/types.ts
+
 import { z } from 'zod';
+
 import { ERROR_SEVERITIES, ERROR_TYPES } from './constants';
 
 /**
@@ -31,7 +34,7 @@ export interface HttpErrorLike {
   status?: number;
   response?: {
     status?: number;
-    data?: { message?: string };
+    data?: { error?: string; error_type?: string };
   };
   message?: string;
 }
@@ -50,6 +53,6 @@ export const applicationErrorSchema = z
     severity: errorSeverityEnum,
     code: z.union([z.string(), z.number()]).nullable().default(null),
     original: z.instanceof(Error).optional().nullable().default(null),
-    details: z.record(z.unknown()).optional().default({}),
+    details: z.record(z.string(), z.unknown()).optional().default({}),
   })
   .strict();

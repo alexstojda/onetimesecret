@@ -1,118 +1,95 @@
 # apps/api/v1/controllers/helpers.rb
+#
+# frozen_string_literal: true
+
+require_relative '../../../../lib/onetime/helpers/session_helpers'
 
 module V1
-
   unless defined?(V1::BADAGENTS)
-    BADAGENTS = [:facebook, :google, :yahoo, :bing, :stella, :baidu, :bot, :curl, :wget]
-    LOCAL_HOSTS = ['localhost', '127.0.0.1'].freeze  # TODO: Add config
+    BADAGENTS     = [:facebook, :google, :yahoo, :bing, :stella, :baidu, :bot, :curl, :wget]
+    LOCAL_HOSTS   = ['localhost', '127.0.0.1'].freeze  # TODO: Add config
     HEADER_PREFIX = ENV.fetch('HEADER_PREFIX', 'X_SECRET_').upcase
   end
 
   module ControllerHelpers
+    include Onetime::Helpers::SessionHelpers
 
-    def plan
-      @plan = Onetime::Plan.plan(cust.planid) unless cust.nil?
-      @plan ||= Onetime::Plan.plan('anonymous')
-      @plan
-    end
+    # `carefully` wraps a v1 API action: it handles errors and exceptions so we
+    # respond consistently — and integrate Sentry here — across all requests.
+    # v1 is a legacy JSON-only API that renders no HTML, so responses default to
+    # JSON and there is no web/redirect handling.
+    def carefully(content_type = 'application/json') # rubocop:disable Metrics/MethodLength
+      # cust may be nil for anonymous requests.
 
-    # `carefully` is a wrapper around the main web application logic. We
-    # handle errors, redirects, and other exceptions here to ensure that
-    # we respond consistently to all requests. That's why we integrate
-    # Sentry here rather than app specific logic.
-    def carefully(redirect=nil, content_type=nil, app: :web) # rubocop:disable Metrics/MethodLength,Metrics/PerceivedComplexity
-      redirect ||= req.request_path unless app == :api
-      content_type ||= 'text/html; charset=utf-8'
-
-      cust ||= V1::Customer.anonymous
-
-      # Prevent infinite redirect loops by checking if the request is a GET request.
-      # Pages redirecting from a POST request can use the same page once.
-      if req.get? && redirect.to_s == req.request_path
-        redirect = '/500'
-      end
-
-      # Generate a unique nonce for this response
-      nonce = SecureRandom.base64(16)
-
-      # Make the nonce available to the CSP header
-      add_response_headers(content_type, nonce)
-
-      # Make the nonce available to the view
-      req.env['ots.nonce'] = nonce
+      # Set the default content-type. v1 emits no CSP or nonce: it serves JSON
+      # only and is never executed by a browser; CSP is owned by Otto.
+      add_response_headers(content_type)
 
       return_value = yield
 
       log_customer_activity
 
-      obscured = if cust.anonymous?
+      obscured = if cust.nil? || cust.anonymous?
         'anonymous'
       else
-        OT::Utils.obscure_email(cust.custid)
+        OT::Utils.obscure_email(cust.email)
       end
 
       return_value
-
     rescue OT::Redirect => ex
       OT.info "[carefully] Redirecting to #{ex.location} (#{ex.status})"
       res.redirect ex.location, ex.status
-
     rescue OT::Unauthorized => ex
       OT.info ex.message
       not_authorized_error
-
-    rescue Onetime::BadShrimp => ex
-      # If it's a json response, no need to set an error message on the session
-      if res.header['Content-Type'] == 'application/json'
-        error_response 'Please refresh the page and try again', reason: "Bad shrimp 🍤"
-      else
-        sess.set_error_message "Please go back, refresh the page, and try again."
-        res.redirect redirect
-      end
-
     rescue OT::FormError => ex
-      OT.ld "[carefully] FormError: #{ex.message} (#{req.path}) redirect:#{redirect || 'n/a'}"
+      OT.ld "[carefully] FormError: #{ex.message} (#{req.path})"
 
       # Track form errors in Sentry. They can indicate bugs that would
       # not surface any other way. We track as messages though since
       # they are not exceptions in the diagnostic sense. We pass only
       # the message and not fields to limit the amount of data sent.
-      capture_message ex.message, :error
-
-      if redirect
-        handle_form_error ex, redirect
-      else
-        handle_form_error ex
+      #
+      # GROUPED BY ENDPOINT, NOT BY MESSAGE (BACKEND-AZ/AH/AD). v1 is an
+      # unauthenticated surface under constant bot traffic, and the default
+      # grouping key for a message event IS the message — so every distinct
+      # validation string anonymous input can provoke minted its own issue, at
+      # error level. Changing HOW malformed bodies fail (#4283 multipart
+      # rejection) therefore read as a brand-new escalating defect when it was
+      # the same bots failing one step earlier. The message stays the event
+      # text, so the backend's message scrubbers still see it and the issue
+      # title still says what failed; the endpoint alone decides the group.
+      #
+      # The group key is the ROUTE TEMPLATE, not `req.path` — see
+      # #endpoint_template. On the wildcard routes (/secret/:key,
+      # /receipt/:key) the concrete path is one-per-key, which would defeat
+      # the grouping this exists for and put the key itself in Sentry.
+      #
+      # Level is :warning, not :error: rejected input is the validator working.
+      capture_message ex.message, :warning do |scope|
+        scope.set_fingerprint(['v1-form-error', endpoint_template])
       end
+
+      handle_form_error ex
 
     # NOTE: It's important to handle MissingSecret before RecordNotFound since
     #       MissingSecret is a subclass of RecordNotFound. If we don't, we'll
     #       end up with a generic error message instead of the specific one.
-    rescue OT::MissingSecret => ex
+    rescue OT::MissingSecret
       secret_not_found_response
-
     rescue OT::RecordNotFound => ex
-      OT.ld "[carefully] RecordNotFound: #{ex.message} (#{req.path}) redirect:#{redirect || 'n/a'}"
-      not_found_response ex.message, shrimp: sess.add_shrimp
+      OT.ld "[carefully] RecordNotFound: #{ex.message} (#{req.path})"
+      not_found_response ex.message
+    rescue Familia::FieldTypeError => ex
+      # session may be a Hash fallback when no session middleware is available
+      session_id       = (session.respond_to?(:id) && session.id&.to_s) || req.cookies['onetime.session'] || 'unknown'
+      short_session_id = session_id.length <= 10 ? session_id : session_id[0, 10] + '...'
+      OT.le "[attempt-saving-non-string-to-db] #{obscured} (#{req.client_ipaddress}): #{short_session_id} (#{req.path})"
 
-    rescue OT::LimitExceeded => ex
-      msg = "#{ex.event}(#{ex.count}) #{sess.identifier.shorten(10)}"
-      OT.le "[limit-exceeded] #{obscured} (#{sess.ipaddress}): #{msg} (#{req.current_absolute_uri})"
-
-      # Track rate limiting as a warning message
-      capture_message "#{ex.message}: #{msg}", :warning
-
-      throttle_response "Cripes! You have been rate limited."
-
-    rescue Familia::HighRiskFactor => ex
-      OT.le "[attempt-saving-non-string-to-redis] #{obscured} (#{sess.ipaddress}): #{sess.identifier.shorten(10)} (#{req.current_absolute_uri})"
-
-      # Track attempts to save non-string data to Redis as a warning error
+      # Track attempts to save non-string data to the database as a warning error
       capture_error ex, :warning
 
-      # Include fresh shrimp so they can try again 🦐
-      error_response "We're sorry, but we can't process your request at this time.", shrimp: sess.add_shrimp
-
+      error_response I18n.t('api.errors.request_processing_error')
     rescue Familia::NotConnected, Familia::Problem => ex
       OT.le "#{ex.class}: #{ex.message}"
       OT.le ex.backtrace
@@ -120,9 +97,7 @@ module V1
       # Track Familia errors as regular exceptions
       capture_error ex
 
-      # Include fresh shrimp so they can try again 🦐
-      error_response "An error occurred :[", shrimp: sess ? sess.add_shrimp : nil
-
+      error_response 'An unexpected error occurred :['
     rescue Errno::ECONNREFUSED => ex
       OT.le ex.message
       OT.le ex.backtrace
@@ -130,22 +105,19 @@ module V1
       # Track DB connection errors as fatal errors
       capture_error ex, :fatal
 
-      error_response "We'll be back shortly!", shrimp: sess ? sess.add_shrimp : nil
-
+      error_response I18n.t('api.errors.service_unavailable')
     rescue StandardError => ex
-      custid = cust&.custid || '<notset>'
-      sessid = sess&.short_identifier || '<notset>'
-      OT.le "#{ex.class}: #{ex.message} -- #{req.current_absolute_uri} -- #{req.client_ipaddress} #{custid} #{sessid} #{locale} #{content_type} #{redirect} "
+      custid           = cust&.custid || '<notset>'
+      # session may be a Hash fallback when no session middleware is available
+      session_id       = (session.respond_to?(:id) && session.id&.to_s) || req.cookies['onetime.session'] || 'unknown'
+      short_session_id = session_id.length <= 10 ? session_id : session_id[0, 10] + '...'
+      OT.le "#{ex.class}: #{ex.message} -- #{req.path} -- #{req.client_ipaddress} #{custid} #{short_session_id} #{locale} #{content_type}"
       OT.le ex.backtrace.join("\n")
 
       # Track the unexected errors
       capture_error ex
 
-      error_response "An unexpected error occurred :[", shrimp: sess ? sess.add_shrimp : nil
-
-    ensure
-      @sess ||= V1::Session.new 'failover', 'anon'
-      @cust ||= V1::Customer.anonymous
+      error_response 'An unexpected error occurred :['
     end
 
     # Sets the locale for the request based on various sources.
@@ -164,12 +136,12 @@ module V1
     # @param locale [String, nil] The locale to be used, if specified.
     # @return [void]
     def check_locale!(locale = nil)
-      locale ||= req.params[:locale]
+      locale ||= req.params['locale']
       locale ||= cust.locale if cust&.locale
       locale ||= (req.env['rack.locale'] || []).first
 
-      have_translations = locale && OT.locales.has_key?(locale)
-      lmsg = format(
+      have_translations = locale && I18n.available_locales.include?(locale.to_sym)
+      lmsg              = format(
         '[check_locale!] class=%s locale=%s cust=%s req=%s t=%s',
         self.class.name,
         locale,
@@ -189,211 +161,25 @@ module V1
       @locale = req.env['ots.locale']
     end
 
-    # Check CSRF value submitted with POST requests (aka shrimp)
-    #
-    # Note: This method is called only for session authenticated
-    # requests. Requests via basic auth (/api), may check for a
-    # valid shrimp, but they don't regenerate a fresh every time
-    # a successful validation occurs.
-    def check_shrimp!(replace=true)
-      return if @check_shrimp_ran
-      @check_shrimp_ran = true
-      return unless req.post? || req.put? || req.delete? || req.patch?
-
-      # Check for shrimp in params and in the O-Shrimp header
-      header_shrimp = (req.env['HTTP_O_SHRIMP'] || req.env['HTTP_ONETIME_SHRIMP']).to_s
-      params_shrimp = req.params[:shrimp].to_s
-
-      # Use the header shrimp if it's present, otherwise use the param shrimp
-      attempted_shrimp = header_shrimp.empty? ? params_shrimp : header_shrimp
-
-      # No news is good news for successful shrimp; by default
-      # it'll simply add a fresh shrimp to the session. But
-      # in the case of failure this will raise an exception.
-      validate_shrimp(attempted_shrimp)
-    end
-
-    def validate_shrimp(attempted_shrimp, replace=true)
-      shrimp_is_empty = attempted_shrimp.empty?
-      log_value = attempted_shrimp.shorten(5)
-
-      if sess.shrimp?(attempted_shrimp) || ignoreshrimp
-        adjective = ignoreshrimp ? 'IGNORED' : 'GOOD'
-        OT.ld "#{adjective} SHRIMP for #{cust.custid}@#{req.path}: #{log_value}"
-        # Regardless of the outcome, we clear the shrimp from the session
-        # to prevent replay attacks. A new shrimp is generated on the
-        # next page load.
-        sess.replace_shrimp! if replace
-        true
-      else
-        ### NOTE: MUST FAIL WHEN NO SHRIMP OTHERWISE YOU CAN
-        ### JUST SUBMIT A FORM WITHOUT ANY SHRIMP WHATSOEVER
-        ### AND THAT'S NO WAY TO TREAT A GUEST.
-        shrimp = (sess.shrimp || '[noshrimp]').clone
-        ex = Onetime::BadShrimp.new(req.path, cust.custid, attempted_shrimp, shrimp)
-        OT.ld "BAD SHRIMP for #{cust.custid}@#{req.path}: #{log_value}"
-        sess.replace_shrimp! if replace && !shrimp_is_empty
-        raise ex
-      end
-    end
-    protected :validate_shrimp
-
-    def check_session!
-      return if @check_session_ran
-      @check_session_ran = true
-
-      # Load from redis or create the session
-      if req.cookie?(:sess) && V1::Session.exists?(req.cookie(:sess))
-        @sess = V1::Session.load req.cookie(:sess)
-      else
-        @sess = V1::Session.create req.client_ipaddress, "anon", req.user_agent
-      end
-
-      # Set the session to rack.session
+    def add_response_headers(content_type)
+      # Set the Content-Type header if it's not already set by the application.
       #
-      # The `req.env` hash is a central repository for all environment variables
-      # and request-specific data in a Rack application. By setting the session
-      # object in `req.env['rack.session']`, we make the session data accessible
-      # to all middleware and components that process the request and response.
-      # This approach ensures that the session data is consistently available
-      # throughout the entire request-response cycle, allowing middleware to
-      # read from and write to the session as needed. This is particularly
-      # useful for maintaining user state, managing authentication, and storing
-      # other session-specific information.
-      #
-      # Example:
-      #   If a middleware needs to check if a user is authenticated, it can
-      #   access the session data via `env['rack.session']` and perform the
-      #   necessary checks or updates.
-      #
-      req.env['rack.session'] = sess
-
-      # Immediately check the the auth status of the session. If the site
-      # configuration changes to disable authentication, the session will
-      # report as not authenticated regardless of the session data.
-      #
-      # NOTE: The session keys have their own dedicated Redis DB, so they
-      # can be flushed to force everyone to logout without affecting the
-      # rest of the data. This is a security feature.
-      sess.disable_auth = !authentication_enabled?
-
-      # Update the session fields in redis (including updated timestamp)
-      sess.save
-
-      # Only set the cookie after session is for sure saved to redis
-      is_secure = Onetime.conf[:site][:ssl]
-
-      # Update the session cookie
-      res.send_cookie :sess, sess.sessid, sess.ttl, is_secure
-
-      # Re-hydrate the customer object
-      @cust = sess.load_customer || V1::Customer.anonymous
-
-      # We also force the session to be unauthenticated based on
-      # the customer object.
-      if cust.anonymous?
-        sess.authenticated = false
-      elsif cust.verified.to_s != 'true'
-        sess.authenticated = false
-      end
-
-      # Should always report false and false when disabled.
-      unless cust.anonymous?
-        custref = cust.obscure_email
-        OT.ld "[sess.check_session(v1)] #{sess.short_identifier} #{custref} authenabled=#{authentication_enabled?.to_s}, sess=#{sess.authenticated?.to_s}"
-      end
-    end
-
-    # Checks if authentication is enabled for the site.
-    #
-    # This method determines whether authentication is enabled by checking the
-    # site configuration. It defaults to disabled if the site configuration is
-    # missing. This approach prevents unauthorized access by ensuring that
-    # accounts are not used if authentication is not explicitly enabled.
-    #
-    # @return [Boolean] True if authentication and sign-in are enabled, false otherwise.
-    #
-    def authentication_enabled?
-      # Defaulting to disabled is the Right Thing to Do™. If the site config
-      # is missing, we assume that authentication is disabled and that accounts
-      # are not used. This prevents situations where the app is running and
-      # anyone accessing it can create an account without proper authentication.
-      authentication_enabled = OT.conf[:site][:authentication][:enabled] rescue false # rubocop:disable Style/RescueModifier
-      signin_enabled = OT.conf[:site][:authentication][:signin] rescue false # rubocop:disable Style/RescueModifier
-
-      # The only condition that allows a request to be authenticated is if
-      # the site has authentication enabled, and the user is signed in. If a
-      # user is signed in and the site configuration changes to disable it,
-      # the user will be signed out temporarily. If the setting is restored
-      # before the session key expires in Redis, that user will be signed in
-      # again. This is a security feature.
-      authentication_enabled && signin_enabled
-    end
-
-    def add_response_headers(content_type, nonce)
-      # Set the Content-Type header if it's not already set by the application
-      res.header['Content-Type'] ||= content_type
-
-      # Skip the Content-Security-Policy header if it's already set
-      return if res.header['Content-Security-Policy']
-
-      # Skip the CSP header unless it's enabled in the experimental settings
-      return if OT.conf.dig(:experimental, :csp, :enabled) != true
-
-      # Skip the Content-Security-Policy header if the front is running in
-      # development mode. We need to allow inline scripts and styles for
-      # hot reloading to work.
-      if OT.conf.dig(:development, :enabled)
-        csp = [
-          "default-src 'none';",                               # Restrict to same origin by default
-          "script-src 'unsafe-inline' 'nonce-#{nonce}';",      # Allow Vite's dynamic module imports and source maps
-          "style-src 'self' 'unsafe-inline';",                 # Enable Vite's dynamic style injection
-          "connect-src 'self' ws: wss: http: https:;",         # Allow WebSocket connections for hot module replacement
-          "img-src 'self' data:;",                             # Allow images from same origin only
-          "font-src 'self';",                                  # Allow fonts from same origin only
-          "object-src 'none';",                                # Block <object>, <embed>, and <applet> elements
-          "base-uri 'self';",                                  # Restrict <base> tag targets to same origin
-          "form-action 'self';",                               # Restrict form submissions to same origin
-          "frame-ancestors 'none';",                           # Prevent site from being embedded in frames
-          "manifest-src 'self';",
-          # "require-trusted-types-for 'script';",
-          "worker-src 'self';",                                # Allow Workers from same origin only
-        ]
-      else
-        csp = [
-          "default-src 'none';",
-          "script-src 'unsafe-inline' 'nonce-#{nonce}';",      # unsafe-inline is ignored with a nonce
-          "style-src 'self' 'unsafe-inline';",
-          "connect-src 'self' wss: https:;",                   # Only HTTPS and secure WebSockets
-          "img-src 'self' data:;",
-          "font-src 'self';",
-          "object-src 'none';",
-          "base-uri 'self';",
-          "form-action 'self';",
-          "frame-ancestors 'none';",
-          "manifest-src 'self';",
-          #"require-trusted-types-for 'script';",
-          "worker-src 'self';",
-        ]
-      end
-
-      OT.ld "[CSP] #{csp.join(' ')}" if OT.debug?
-
-      res.header['Content-Security-Policy'] = csp.join(' ')
-    end
-
-    def log_customer_activity
-      return if cust.anonymous?
-      reqstr = stringify_request_details(req)
-      custref = cust.obscure_email
-      OT.info "[carefully] #{sess.short_identifier} #{custref} at #{reqstr}"
+      # Content-Security-Policy is emitted by Otto's response layer, the single
+      # policy source for the app. The deprecated v1 API no longer defines its
+      # own parallel policy here.
+      res.headers['content-type'] ||= content_type
     end
 
     # Collectes request details in a single string for logging purposes.
     #
-    # This method collects the IP address, request method, path, query string,
-    # and proxy header details from the given request object and formats them
-    # into a single string. The resulting string is suitable for logging.
+    # This method collects the IP address, request method, path, and proxy
+    # header details from the given request object and formats them into a
+    # single string. The resulting string is suitable for logging. The query
+    # string is intentionally omitted -- this is called on every authenticated
+    # request via log_customer_activity, and a query string can carry the same
+    # class of sensitive value (an accidentally-appended secret/token) that
+    # Onetime::ErrorHandler.safe_request_context guards against on the error
+    # path.
     #
     # @param req [Rack::Request] The request object containing the details to be
     #   stringified.
@@ -402,64 +188,19 @@ module V1
     # @example
     #   req = Rack::Request.new(env)
     #   stringify_request_details(req)
-    #   # => "192.0.2.1; GET /path?query=string; Proxy[HTTP_X_FORWARDED_FOR=203.0.113.195 REMOTE_ADDR=192.0.2.1]"
+    #   # => "192.0.2.1; GET /path; Proxy[HTTP_X_FORWARDED_FOR=203.0.113.195 REMOTE_ADDR=192.0.2.1]"
     #
     def stringify_request_details(req)
       header_details = collect_proxy_header_details(req.env)
 
       details = [
         req.ip,
-        "#{req.request_method} #{req.path_info}?#{req.query_string}",
+        "#{req.request_method} #{req.path_info}",
         "Proxy[#{header_details}]",
       ]
 
       # Convert the details array to a string for logging
       details.join('; ')
-    end
-
-    # Sentry terminology:
-    #   - An event is one instance of sending data to Sentry. Generally, this
-    #   data is an error or exception.
-    #   - An issue is a grouping of similar events.
-    #   - Capturing is the act of reporting an event.
-    #
-    # Available levels are :fatal, :error, :warning, :log, :info,
-    # and :debug. The Sentry default, if not specified, is :error.
-    #
-    def capture_error(error, level=:error, &)
-      return unless OT.d9s_enabled # diagnostics are disabled by default
-
-      # Capture more detailed debugging information when Sentry errors occur
-      begin
-        # Log request headers before attempting to send to Sentry
-        if defined?(req) && req.respond_to?(:env)
-          headers = req.env.select { |k, _v| k.start_with?('HTTP_') rescue false } # rubocop:disable Style/RescueModifier
-          OT.ld "[capture_error] Request headers: #{headers.inspect}"
-        end
-
-        # Try Sentry exception reporting
-        Sentry.capture_exception(error, level: level, &)
-      rescue NoMethodError => e
-        if e.message.include?('start_with?')
-          OT.le "[capture_error] Sentry error with nil value in start_with? check: #{e.message}"
-          OT.ld e.backtrace.join("\n")
-          # Continue execution - don't let a Sentry error break the app
-        else
-          # Re-raise any other NoMethodError that isn't related to start_with?
-          raise
-        end
-      rescue StandardError => ex
-        OT.le "[capture_error] #{ex.class}: #{ex.message}"
-        OT.ld ex.backtrace.join("\n")
-      end
-    end
-
-    def capture_message(message, level=:log, &)
-      return unless OT.d9s_enabled # diagnostics are disabled by default
-      Sentry.capture_message(message, level: level, &)
-    rescue StandardError => ex
-      OT.le "[capture_message] #{ex.class}: #{ex.message}"
-      OT.ld ex.backtrace.join("\n")
     end
 
     # Collects and formats specific HTTP header details from the given
@@ -485,8 +226,8 @@ module V1
     #   collect_proxy_header_details(env)
     #   # => "HTTP_X_FORWARDED_FOR=203.0.113.195 REMOTE_ADDR=192.0.2.1 CF-Connecting-IP=203.0.113.195 CF-IPCountry=US CF-Ray=1234567890abcdef CF-Visitor={\"scheme\":\"https\"}"
     #
-    def collect_proxy_header_details(env=nil, keys=nil)
-      env ||= {}
+    def collect_proxy_header_details(env = nil, keys = nil)
+      env  ||= {}
       keys ||= %w[
         HTTP_FLY_REQUEST_ID
         HTTP_VIA
@@ -505,7 +246,7 @@ module V1
       prefix_keys = env.keys.select { |key| key.upcase.start_with?("HTTP_#{HEADER_PREFIX}") }
       keys.concat(prefix_keys) # the bang is silent
 
-      keys.sort.map { |key|
+      keys.sort.map do |key|
         # Normalize the header name so it looks identical in the logs as it
         # does in the browser dev console.
         #
@@ -513,26 +254,10 @@ module V1
         #
         pretty_name = key.sub(/^HTTP_/, '').split('_').map(&:capitalize).join('-')
         "#{pretty_name}: #{env[key]}"
-      }.join(" ")
+      end.join(' ')
     end
 
-    def secure_request?
-      !local? || secure?
-    end
-
-    def secure?
-      # It's crucial to only accept header values set by known, trusted
-      # sources. See Caddy config docs re: trusted_proxies.
-      # X-Scheme is set by e.g. nginx, caddy etc
-      # X-FORWARDED-PROTO is set by load balancer e.g. ELB
-      (req.env['HTTP_X_FORWARDED_PROTO'] == 'https' || req.env['HTTP_X_SCHEME'] == "https")
-    end
-
-    def local?
-      (LOCAL_HOSTS.member?(req.env['SERVER_NAME']) && (req.client_ipaddress == '127.0.0.1'))
-    end
-
-    def deny_agents! *agents
+    def deny_agents! *_agents
       BADAGENTS.flatten.each do |agent|
         if req.user_agent =~ /#{agent}/i
           raise OT::Redirect.new('/')
@@ -541,16 +266,190 @@ module V1
     end
 
     def no_cache!
-      res.header['Cache-Control'] = "no-store, no-cache, must-revalidate, max-age=0"
-      res.header['Expires'] = "Mon, 7 Nov 2011 00:00:00 UTC"
-      res.header['Pragma'] = "no-cache"
+      # @see https://www.rubydoc.info/gems/rack/Rack/Response/Helpers#do_not_cache!-instance_method
+      res.do_not_cache!
     end
 
-    def app_path *paths
-      paths = paths.flatten.compact
-      paths.unshift req.script_name
-      paths.join('/').gsub '//', '/'
+    # Note: app_path is not defined here. Otto provides it on both req and res,
+    # prepending script_name to support sub-path mounting. Use req.app_path(...).
+
+    # session_auth_enforced? is inherited from SessionHelpers (included
+    # at the top of this module). It uses safe `dig` access and defaults
+    # to disabled when config is absent — account features are rendered
+    # unavailable unless authentication is explicitly configured.
+    # See lib/onetime/helpers/session_helpers.rb.
+
+    def log_customer_activity
+      return if cust.nil? || cust.anonymous?
+
+      reqstr           = stringify_request_details(req)
+      custref          = cust.obscure_email
+      # session may be a Hash fallback when no session middleware is available
+      session_id       = (session.respond_to?(:id) && session.id&.to_s) || req.cookies['onetime.session'] || 'unknown'
+      short_session_id = session_id.length <= 10 ? session_id : session_id[0, 10] + '...'
+      OT.info "[carefully] #{short_session_id} #{custref} at #{reqstr}"
     end
 
+    # Sentry terminology:
+    #   - An event is one instance of sending data to Sentry. Generally, this
+    #   data is an error or exception.
+    #   - An issue is a grouping of similar events.
+    #   - Capturing is the act of reporting an event.
+    #
+    # Available levels are :fatal, :error, :warning, :log, :info,
+    # and :debug. The Sentry default, if not specified, is :error.
+    #
+    def capture_error(error, level = :error, &block)
+      OT.ld "[sentry] api capture_error → decision exception=#{error.class} level=#{level} " \
+            "d9s_enabled=#{OT.d9s_enabled} sentry_defined=#{defined?(Sentry) ? true : false} " \
+            "sentry_initialized=#{(defined?(Sentry) && Sentry.initialized?) || false}"
+
+      unless OT.d9s_enabled # diagnostics are disabled by default
+        OT.ld '[sentry] api capture_error skipped — d9s_enabled=false'
+        return
+      end
+
+      # Log request headers before attempting to send to Sentry
+      if defined?(req) && req.respond_to?(:env)
+        headers = Onetime::ErrorHandler.http_headers_from(req.env)
+        OT.ld "[capture_error] Request headers: #{headers.inspect}"
+      end
+
+      # Capture exception with request context for debugging in Sentry
+      event_id = Sentry.capture_exception(error, level: level) do |scope|
+        # Pseudonymous "users affected" attribution. Opaque keyed ref only —
+        # never the email, custid, session id or IP. Anonymous requests and
+        # unkeyed deployments set no user at all. This block scope is
+        # per-event, so nothing here leaks into a later request.
+        if defined?(cust)
+          Onetime::ErrorHandler.set_diagnostics_actor(scope, cust)
+        end
+
+        # Add searchable tags (guard req to avoid NameError if not defined)
+        # Route template, never the concrete path: an `endpoint` tag carrying
+        # a secret key is both unbounded-cardinality and a leak (see
+        # #endpoint_template).
+        scope.set_tags(
+          service: 'api',
+          endpoint: endpoint_template,
+        )
+
+        # Add request context: path only (never the query string) plus any
+        # explicitly allow-listed params — see Onetime::ErrorHandler.safe_request_context.
+        if defined?(req) && req.respond_to?(:path)
+          scope.set_context('request', Onetime::ErrorHandler.safe_request_context(req))
+        end
+
+        # Add customer/session context with truncated IDs for privacy
+        if defined?(cust) && cust && !cust.anonymous?
+          scope.set_context(
+            'customer',
+            {
+              custid: truncate_id(cust.custid),
+              role: cust.role,
+            },
+          )
+        end
+
+        if defined?(sess) && sess.respond_to?(:sessid)
+          scope.set_context(
+            'session',
+            {
+              sessid: truncate_id(sess.sessid),
+            },
+          )
+        end
+
+        # Allow caller to add additional context via block
+        block&.call(scope)
+      end
+      OT.ld "[sentry] api capture_error returned event_id=#{event_id.inspect} exception=#{error.class}"
+    rescue NoMethodError => ex
+      raise unless ex.message.include?('start_with?')
+
+      # Continue execution - don't let a Sentry error break the app
+      OT.le "[capture_error] Sentry error with nil value in start_with? check: #{ex.message}"
+      OT.ld ex.backtrace.join("\n")
+    rescue StandardError => ex
+      OT.le "[capture_error] #{ex.class}: #{ex.message}"
+      OT.ld ex.backtrace.join("\n")
+    end
+
+    # Truncates an ID string for privacy while keeping it useful for debugging.
+    # Shows first 8 characters followed by ellipsis.
+    # @param id [String, nil] ID to truncate
+    # @return [String] Truncated ID or 'unknown' if nil/empty
+    def truncate_id(id)
+      return 'unknown' if id.nil? || id.to_s.empty?
+
+      id_str = id.to_s
+      id_str.length <= 8 ? id_str : "#{id_str[0, 8]}..."
+    end
+    private :truncate_id
+
+    # The endpoint identity used for the Sentry `endpoint` tag and for the
+    # FormError grouping fingerprint.
+    #
+    # NEVER the bare `req.path`. The v1 wildcard routes — /secret/:key,
+    # /receipt/:key, /receipt/:key/burn and the /private/ and /metadata/
+    # aliases — put the concrete secret or receipt key in the path, and both
+    # consumers of this value are the wrong place for it:
+    #   - CARDINALITY: one distinct fingerprint (and one distinct tag value)
+    #     per key, which is precisely the per-message issue explosion the
+    #     fingerprint was added to stop.
+    #   - DISCLOSURE: NOTHING scrubs event.tags — not before_send, not the
+    #     SDK — so the tag half of this is the only thing standing between a
+    #     raw path and Sentry. The fingerprint has a backstop
+    #     (SetupDiagnostics.scrub_event_fingerprint), but a backstop is not a
+    #     licence to hand it a credential: it redacts, which loses the
+    #     endpoint identity this value exists to carry.
+    #
+    # Otto stamps the matched route onto the env during dispatch
+    # (otto/route.rb -> env['otto.route_definition']). Its #path is the
+    # DECLARED template from routes.txt ('/secret/:key'), so it is the
+    # endpoint identity we want and structurally cannot carry request data.
+    # In the mounted stack it is always present by the time a controller
+    # runs; the fallback is for harnesses that invoke a controller without
+    # Otto's dispatch (unit specs), and it scrubs the raw path rather than
+    # trusting it.
+    #
+    # @return [String] route template, scrubbed path, or 'unknown'
+    def endpoint_template
+      return 'unknown' unless defined?(req) && req
+
+      route    = req.env['otto.route_definition'] if req.respond_to?(:env) && req.env.respond_to?(:[])
+      template = route.path if route.respond_to?(:path)
+      return template if template.is_a?(String) && !template.empty?
+
+      raw = req.path_info if req.respond_to?(:path_info)
+      raw = req.path if (raw.nil? || raw.empty?) && req.respond_to?(:path)
+      return 'unknown' if raw.nil? || raw.empty?
+
+      scrub_endpoint_path(raw)
+    rescue StandardError
+      'unknown'
+    end
+    private :endpoint_template
+
+    # Reuses the diagnostics URL scrubber so the fallback above can never
+    # emit an identifier the before_send pass would have redacted. Fails
+    # closed to 'unknown' when diagnostics are not loaded (bare unit
+    # harnesses) rather than returning the unscrubbed path.
+    def scrub_endpoint_path(raw)
+      return 'unknown' unless defined?(Onetime::Initializers::SetupDiagnostics) &&
+                              Onetime::Initializers::SetupDiagnostics.respond_to?(:scrub_url)
+
+      Onetime::Initializers::SetupDiagnostics.scrub_url(raw) || 'unknown'
+    end
+    private :scrub_endpoint_path
+
+    def capture_message(message, level = :log, &)
+      return unless OT.d9s_enabled # diagnostics are disabled by default
+
+      Sentry.capture_message(message, level: level, &)
+    rescue StandardError => ex
+      OT.le "[capture_message] #{ex.class}: #{ex.message}"
+      OT.ld ex.backtrace.join("\n")
+    end
   end
 end

@@ -1,35 +1,74 @@
 // vite.config.ts
 
+import VueI18nPlugin from '@intlify/unplugin-vue-i18n/vite';
+import tailwindcss from '@tailwindcss/vite';
 import Vue from '@vitejs/plugin-vue';
+import { execSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import process from 'process';
 import Markdown from 'unplugin-vue-markdown/vite';
-import { defineConfig } from 'vite';
+import { defineConfig, type PluginOption } from 'vite';
 
 import { addTrailingNewline } from './src/build/plugins/addTrailingNewline';
 import { DEBUG } from './src/utils/debug';
 
-//import { createHtmlPlugin } from 'vite-plugin-html'
-//import checker from 'vite-plugin-checker';
-//import vueDevTools from 'vite-plugin-vue-devtools';
-//import Inspector from 'vite-plugin-vue-inspector'; // OR vite-plugin-vue-inspector
+import VueDevTools from 'vite-plugin-vue-devtools';
+import Inspector from 'vite-plugin-vue-inspector';
 
 // Remember, for security reasons, only variables prefixed with VITE_ are
 // available here to prevent accidental exposure of sensitive
 // environment variables to the client-side code.
 const viteBaseUrl = process.env.VITE_BASE_URL;
 
-// According to the documentation, we should be able to set the allowed hosts
-// via __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS but as of 5.4.15, that is not
-// working as expected. So here we capture the value of that env var with
-// and without the __ prefix and if either are defined, add the hosts to
-// server.allowedHosts below. Multiple hosts can be separated by commas.
+/**
+ * Sentry Release Version - Single Source of Truth
+ * ------------------------------------------------
+ * Determines the release version for both:
+ * - Build-time injection into frontend bundle (__SENTRY_RELEASE__)
+ * - Sentry sourcemap upload tagging
+ *
+ * Fallback chain:
+ * 1. SENTRY_RELEASE env var (explicit override for CI/CD)
+ * 2. .commit_hash.txt file (created by pre-commit hook, baked into Docker)
+ * 3. git rev-parse (local development with git available)
+ * 4. 'dev' (local development without git)
+ *
+ * Note: execSync is used here with a static command string (no user input),
+ * which is safe for build-time git SHA retrieval.
+ *
+ * @see PR #2995 for backend release tracking
+ */
+function getSentryRelease(): string {
+  // 1. Explicit environment variable takes precedence
+  const envRelease = process.env.SENTRY_RELEASE;
+  if (envRelease) {
+    return envRelease;
+  }
+
+  // 2. Pre-generated commit hash file (Docker builds, CI artifacts)
+  const commitHashPath = resolve(process.cwd(), '.commit_hash.txt');
+  if (existsSync(commitHashPath)) {
+    const hash = readFileSync(commitHashPath, 'utf-8').trim();
+    if (hash) {
+      return hash;
+    }
+  }
+
+  // 3. Git SHA for local development (5s timeout prevents hanging builds)
+  try {
+    return execSync('git rev-parse --short=7 HEAD', { timeout: 5000 }).toString().trim();
+  } catch {
+    // 4. Final fallback for environments without git
+    return 'dev';
+  }
+}
+
+// server.allowedHosts - Multiple hosts can be separated by commas.
 //
 // https://vite.dev/config/server-options.html#server-allowedhosts
 // https://github.com/vitejs/vite/security/advisories/GHSA-vg6x-rcgg-rjx6
-const viteAdditionalServerAllowedHosts =
-  process.env.__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS ??
-  process.env.VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS;
+const viteAdditionalServerAllowedHosts = process.env.VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS;
 
 /**
  * Vite Configuration - Consolidated Assets
@@ -38,6 +77,10 @@ const viteAdditionalServerAllowedHosts =
  * - Single JS bundle (no code splitting)
  * - Separate style.css entry
  * - Simplified manifest format
+ *
+ * The single-bundle approach enables strict Content Security Policy (CSP)
+ * implementation with nonces, as each script chunk would otherwise require
+ * its own unique nonce attribute.
  *
  * Manifest Output Example:
  * {
@@ -51,36 +94,25 @@ const viteAdditionalServerAllowedHosts =
  * }
  *
  * @see 29ffd790d74599bbbe3755d0fcba2b59c2f59ed7
- *
- * Previously used Vite's default code splitting behavior, producing:
- * - Multiple JS chunks for dynamic imports
- * - Separate CSS files
- * - Standard Vite manifest format with CSS files listed in main entry
- *
- * Manifest Output Example:
- * {
- *   "main.ts": {
- *     "file": "assets/main.[hash].js",
- *     "css": ["assets/style.[hash].css"],
- *     "imports": ["_vendor.[hash].js"]
- *   }
- * }
  */
-export default defineConfig({
-  // Sets project root to ./src directory
-  // - All imports will be resolved relative to ./src
-  // - Static assets should be placed in ./src/public
-  // - Index.html should be in ./src
+// Two-pass single-chunk build. Rolldown rejects multiple inputs under
+// output.codeSplitting:false, and our CSP nonce model wants exactly one script
+// tag per shell — so each entry is built as its OWN single-input pass, selected
+// by VITE_BUILD_TARGET (see the `build` npm script). Default pass = the customer
+// bundle (main.ts); the admin pass builds the isolated Colonel console (admin.ts)
+// into the same dist without wiping it, under a separate manifest.
+const isAdminBuild = process.env.VITE_BUILD_TARGET === 'admin';
+
+// eslint-disable-next-line max-lines-per-function
+export default defineConfig(({ command: _command }) => ({
+  // Project root is ./src (imports resolve from here, index.html lives here)
   root: './src',
-  // If root is NOT set:
-  // - Project root will be the directory with vite.config.ts
-  // - Static assets go in ./public
-  // - Index.html should be in project root
+
   plugins: [
-    // re: order of plugins
-    // - Vue plugin should be early in the chain
-    // - Transformation/checking plugins follow framework plugins
-    // - Plugins that modify code should precede diagnostic plugins
+    // Plugin order matters: Tailwind CSS first for stylesheet processing
+    tailwindcss(),
+
+    // Then Vue for component compilation
     Vue({
       include: [/\.vue$/, /\.md$/], // <-- allows Vue to compile Markdown files
       template: {
@@ -110,29 +142,71 @@ export default defineConfig({
          * Reference: Discovered via stack trace to Pinia devtools initialization:
          * $subscribe @ pinia.js -> devtoolsInitApp @ chunk-LR5MW2GB.js -> mount
          */
-        compilerOptions: {
-          // Be cool and chill about 3rd party components. Alternatvely can use
-          // `app.config.compilerOptions.isCustomElement = tag => tag.startsWith('altcha-')`
-          // in main.ts.
-          isCustomElement: (tag: string | string[]) => tag.includes('altcha-'),
-        },
+        compilerOptions: {},
       },
     }),
 
-    // // Enable type checking and linting w/o blocking hmr
-    // checker({
-    //   typescript: true,
-    //   vueTsc: true,
-    // }),
+    /**
+     * Vue I18n Plugin - Handles internationalization
+     * ------------------------------------------------
+     * Locales are pre-merged by Python script (locales/scripts/i18n content compile)
+     * into single JSON files per locale in generated/locales/{locale}.json.
+     * The src/i18n.ts module loads these pre-merged files directly.
+     */
+    VueI18nPlugin({
+      // Disable automatic locale file discovery - we load pre-merged files
+      // from generated/locales/ in src/i18n.ts
+      include: [],
+
+      // compositionOnly: true
+      // - Only generates Composition API code (no Options API compatibility)
+      // - Smaller bundle size, modern Vue 3 approach
+      // - Requires using useI18n() instead of $t in <script>
+      compositionOnly: true,
+
+      // runtimeOnly: false
+      // - Includes the full message compiler at runtime (not just pre-compiled)
+      // - Allows dynamic message compilation and runtime template features
+      // - Better Vue devtools support for inspecting translations
+      // - Trade-off: ~8KB larger bundle vs. full runtime capabilities
+      runtimeOnly: false,
+
+      // fullInstall: true
+      // - Includes all i18n APIs (datetime, number formatting, pluralization, etc.)
+      // What fullInstall provides but you DON'T use:
+      // - $d() / d() - datetime formatting (0 instances)
+      // - $n() / n() - number formatting (0 instances)
+      // - $tm() / tm() - translation message object access (0 instances)
+      // - Advanced composition functions beyond t()
+      // - Trade-off: Larger bundle vs. complete i18n functionality
+      fullInstall: true,
+
+      // strictMessage: true
+      // - Enforces strict message format validation during compilation
+      // - Special characters (@, {, }, etc.) must be properly escaped
+      // - Catches syntax errors early at build time
+      // - Prevents runtime message parsing failures
+      // - Example: Use "email{'@'}example.com" not "email@example.com"
+      strictMessage: true,
+
+      // escapeHtml: true
+      // - Automatically escapes HTML entities in translation strings
+      // - Use v-html directive if intentional HTML formatting needed
+      escapeHtml: true,
+
+      // defaultSFCLang: 'json'
+      // - Default language format for Single File Component i18n blocks
+      // - Specifies that <i18n> blocks in .vue files use JSON format
+      // - Alternatives: 'yaml', 'json5', 'yml'
+      defaultSFCLang: 'json',
+    }),
 
     // Enable Vue Devtools
-    //vueDevTools(),
-    //Inspector(),
+    VueDevTools({ launchEditor: 'zed' }),
+    Inspector(),
 
     // https://github.com/unplugin/unplugin-vue-markdown
-    Markdown({
-      /* options */
-    }),
+    Markdown({}),
 
     /**
      * Makes sure all text output files have a trailing newline.
@@ -150,12 +224,15 @@ export default defineConfig({
      * @see ./src/build/plugins/addTrailingNewline.ts for implementation details.
      */
     addTrailingNewline(),
-  ],
+    // Note: Sentry sourcemaps are uploaded via CI (sentry-cli), not at build time.
+    // This keeps auth tokens out of the build context. See .github/workflows/build-and-publish-oci-images.yml
+  ].filter(Boolean) as PluginOption[],
 
   resolve: {
     alias: {
       '@': resolve(process.cwd(), './src'),
       '@tests': resolve(process.cwd(), './tests'),
+      '@generated': resolve(process.cwd(), './generated'),
       // vue: 'vue/dist/vue.runtime.esm-bundler.js',
     },
   },
@@ -167,14 +244,7 @@ export default defineConfig({
 
   // be simpler and more efficient.
   build: {
-    minify: 'terser',
-    terserOptions: {
-      compress: {
-        drop_console: true,
-        drop_debugger: true,
-        passes: 2, // Number of compression passes
-      },
-    },
+    minify: true,
     outDir: '../public/web/dist',
 
     // It's important in staging to keep the previous files around during and
@@ -182,71 +252,51 @@ export default defineConfig({
     // in going to one or the other machines can continue serving the previous
     // version, and for an hour after the deploy for the redis cache to expire
     // (or be manually deleted). The key is template:global:vite_assets in db 0.
-    emptyOutDir: true,
+    //
+    // The admin pass runs AFTER the main pass and must NOT wipe the customer
+    // bundle it just built, so it appends to dist instead of emptying it.
+    emptyOutDir: !isAdminBuild,
 
-    // Code Splitting vs Combined Files
+    // Single Bundle Strategy
     //
-    // Code Splitting:
-    // Advantages:
-    // 1. Improved Initial Load Time: Only the necessary code for the initial page
-    // is loaded, with additional code loaded as needed.
-    // 2. Better Caching: Smaller, more granular files can be cached more
-    // effectively. Changes in one part of the application only require updating
-    // the corresponding file.
-    // 3. Parallel Loading: Modern browsers can download multiple files in
-    // parallel, speeding up the overall loading process.
+    // We intentionally disable code splitting to support CSP nonces.
+    // While this increases initial load time, it simplifies nonce
+    // management by requiring only one script tag. Code splitting would
+    // require generating and tracking nonces for each chunk, adding
+    // complexity without significant benefit for our use case.
     //
-    // Disadvantages:
-    // 1. Increased Complexity: Managing multiple files can be more complex,
-    // especially with dependencies and ensuring correct load order.
-    // 2. More HTTP Requests: More files mean more HTTP requests, which can be a
-    // performance bottleneck on slower networks.
-    //
-    // Combined Files:
-    // Advantages:
-    // 1. Simplicity: A single file is easier to manage and deploy, with no
-    // concerns about missing files or incorrect load orders.
-    // 2. Fewer HTTP Requests: Combining everything into a single file reduces the
-    // number of HTTP requests, beneficial for performance on slower networks.
-    //
-    // Disadvantages:
-    // 1. Longer Initial Load Time: The entire application needs to be downloaded
-    // before it can be used, increasing initial load time.
-    // 2. Inefficient Caching: Any change in the application requires the entire
-    // bundle to be re-downloaded.
-    //
-    // Conclusion:
-    // The conventional approach in modern web development is to use code
-    // splitting for better performance and caching. However, the best approach
-    // depends on the specific use case. For larger applications, code splitting
-    // is usually preferred, while for smaller applications, combining files might
-    manifest: true,
-    rollupOptions: {
-      input: {
-        main: 'src/main.ts',
-      },
+    // Each entry (main.ts, admin.ts) is built in its own pass so it stays a
+    // single self-contained chunk; the passes write separate manifests so the
+    // backend can resolve each shell's assets independently.
+    manifest: isAdminBuild ? '.vite/manifest-admin.json' : true,
+    rolldownOptions: {
+      input: isAdminBuild
+        ? { admin: 'admin.ts' } // isolated Colonel admin console
+        : { main: 'main.ts' }, // customer bundle
       output: {
-        // Enforce single chunk output
-        inlineDynamicImports: true,
+        // Enforce single chunk output (replaces deprecated inlineDynamicImports)
+        codeSplitting: false,
         format: 'es',
         entryFileNames: 'assets/[name].[hash].js',
         assetFileNames: 'assets/[name].[hash].[ext]',
         // Prevent dynamic imports
         preserveModules: false,
+        // Rolldown native minification options (replaces terserOptions).
+        // Terser is incompatible with Rolldown's output format and produces
+        // "undefined is not a function" at runtime.
+        minify: {
+          compress: {
+            dropConsole: true,
+            dropDebugger: true,
+          },
+          mangle: true,
+        },
       },
     },
 
-    // Pollyfill preloads are disabled while we establish our
-    // strict CSP headers. We will revisit again whether these
-    // are still useful or to remove.
-    // https://guybedford.com/es-module-preloading-integrity
-    // https://github.com/vitejs/vite/issues/5120#issuecomment-971952210
-    //modulePreload: {
-    //  polyfill: true,
-    //},
-
     cssCodeSplit: false,
     sourcemap: true,
+    chunkSizeWarningLimit: 3000, // up from default 500 KB to accommodate single bundle
   },
 
   css: {
@@ -274,6 +324,15 @@ export default defineConfig({
    */
   server: {
     origin: viteBaseUrl,
+    // HMR must use the same host as the browser to avoid WebSocket connection failures.
+    // When the browser is at dev.onetime.dev but HMR tries localhost:5173, the connection
+    // fails and can cause components to re-mount outside the Vue app context.
+    hmr: viteBaseUrl
+      ? {
+          host: new URL(viteBaseUrl).hostname,
+          protocol: 'wss',
+        }
+      : true,
     allowedHosts: (() => {
       // NOTE: This is an Immediately Invoked Function Expression (IIFE)
       // that executes exactly once during config load/parsing time.
@@ -319,5 +378,11 @@ export default defineConfig({
       viteAdditionalServerAllowedHosts
     ),
     __VUE_PROD_DEVTOOLS__: DEBUG,
+    // vue-i18n (intlify) feature flags — Rollup auto-replaced these but
+    // Rolldown requires explicit definition to avoid ReferenceError at runtime
+    __INTLIFY_PROD_DEVTOOLS__: false,
+    // Sentry release version baked at build time to match sourcemap uploads.
+    // Falls back to 'dev' when .commit_hash.txt doesn't exist (local development).
+    __SENTRY_RELEASE__: JSON.stringify(getSentryRelease()),
   },
-});
+}));

@@ -1,53 +1,83 @@
-# Onetime Secret - API Definition
+# Onetime Secret - API Documentation
 
-This directory contains the API definition for the Onetime Secret API in OpenAPI 3.0 format.
+The authoritative API documentation is published at [api.onetimesecret.com](https://api.onetimesecret.com).
 
-## Overview
+## API Versions
 
-Onetime Secret provides two versions of its API:
+Onetime Secret provides three versions of its API:
 
-1. **API v1**: The original API for creating and viewing secrets.
-2. **API v2**: An updated version with significant additions and changes. Used by the onetimesecret.com UI (Vue-based frontend). Currently designed for internal use but may be polished for more convenient public consumption in the future.
+* **v1**: The original API for creating and viewing secrets. Requests are form-encoded and responses are JSON. This version receives limited support mainly to keep parity with new fields but in general does not receive new features (new or renamed fields are added but existing fields are not removed or renamed). For new integrations, we recommend using v2 or v3.
+* **v2**: A modern, fully JSON REST API. All field values are returned as strings which can be both a blessing because it eliminates guesswork about field types but also a curse because it requires more parsing on the client side. This version has been superseded by v3 but is still maintained for backward compatibility.
+* **v3**: Our most recent API version, used by the UI (Vue-based frontend). The API is substantially similar to v2 but field values are returned as JSON primitive types (strings, numbers, booleans, arrays, objects). This version is the most actively developed and receives all new features and updates.
 
-These API versions are currently maintained in a single file due to technical constraints, but we plan to separate them in the future.
-## Files
+## Authentication
 
-- `index.json`: OpenAPI v3.0 definition containing both API v1 and v2.
+The REST API uses HTTP Basic auth. The **username is the account email or the customer external ID** (`ur…` prefix); the **password is the API token** (generated on the Account > API settings page or via `bin/ots apitoken`).
 
-## API Version Separation: Future Plans
+The username is **not** the organization ID (`on…` prefix) and **not** the UUIDv7 `owner_id` that appears in API responses — neither resolves to a customer.
 
-While we currently maintain both v1 and v2 APIs in a single OpenAPI 3 definition file, we intend to separate these versions in the future. Our goal is to eventually maintain separate API definitions for the following reasons:
+```bash
+curl -u 'user@example.com:APITOKEN' https://us.onetimesecret.com/api/v2/receipt/recent
+```
 
-1. **Clarity and organization**: Separate definitions will provide clearer documentation and prevent confusion for API consumers.
-2. **Independent maintenance**: Updates and changes can be made to each version without affecting the other.
-3. **Improved developer experience**: API consumers will be able to easily choose the version they need without navigating through mixed documentation.
-4. **Version-specific testing**: Facilitating independent testing and validation for each version.
-5. **Efficient deprecation management**: Easier to manage if we plan to deprecate the older version in the future.
-6. **Scalability**: As our API evolves, separate files will be more manageable for future versions.
+## Response Field Notes
 
-We recognize the benefits of this approach and plan to implement this separation as soon as the technical limitations are addressed. This will allow us to better serve our API consumers and maintain a more organized and efficient API ecosystem.
+These conventions apply to secret and receipt responses. Field value *types* differ by version (see [API Versions](#api-versions)); the field *meanings* below are the same across versions unless noted.
 
-## Using the API Definition
+### `custid` is deprecated — read `owner_id`
 
-### For Developers
+Secret creation writes `owner_id` only, so `custid` is null on every receipt created since the v0.24 identifier migration.
 
-- Refer to the specific version's documentation within the OpenAPI definition for endpoint details, request parameters, and response formats.
-- Ensure you're using the correct API version for your integration.
-- Check the changelog (if available) for updates and changes between versions.
+* **v3 receipt records omit the field entirely.** `owner_id` is the only creator identifier.
+* **v2 still emits it** on the receipt record — null on post-migration records — for older clients.
+* **v1 is the exception**: it translates `custid` back to an email address (`"anon"` for anonymous secrets). See `apps/api/v1/COMPAT.md`.
+* `owner_id` is null on receipts with `source: "incoming"` (as is `custid` in v2). The creator identifier is withheld for guest-submitted provenance regardless of migration state.
 
-## Version Differences
+A `custid` key does still appear at the top level of receipt-list responses, alongside `records` rather than inside them. That is the identifier of the customer making the request, not of a receipt's creator — a different field that happens to share the name.
 
-While both API versions serve the core functionality of Onetime Secret, they differ in several aspects:
+### `metadata` is a v2 alias of `receipt`
 
-- Endpoint naming conventions
-- Request and response structures
-- Available features and capabilities
+"Receipt" is the current name for the record the secret's creator keeps. Conceal and generate responses emit the same serialized receipt under both names in v2:
 
-There is only about 20% overlap in terms of fields and endpoint naming between v1 and v2. Refer to each version's specific documentation within the OpenAPI definition for detailed information on endpoints and usage.
+| Version | Keys under `record`                                                     |
+| ------- | ----------------------------------------------------------------------- |
+| v1      | `metadata` only                                                         |
+| v2      | `receipt` and `metadata` — identical objects, not two views of a record |
+| v3      | `receipt` only                                                          |
 
-## Support and Questions
+Write new integrations against `receipt`.
 
-If you have any questions about using this API definition or need clarification on version differences, please contact our support team or refer to the official Onetime Secret documentation.
+The alias covers the record object only. Receipt responses (`GET /receipt/:key`) also return `metadata_path` and `metadata_url` as aliases of `receipt_path` and `receipt_url`; those aliases are still present in v3.
+
+### Three distinct recipient fields
+
+`recipients`, `recipient`, and `recipient_name` are separate fields with separate meanings — not spelling variants of one another.
+
+| Field            | Location                                   | Value                                                                                                                                                                                            |
+| ---------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `recipients`     | receipt record                             | Who the secret link was emailed to, obscured at serialization (`al***@e***.com`). In v2, a single string — `, `-joined for multiple addresses, `""` when the secret was never emailed. In v3, an array of obscured addresses, or `null` when there are none — never `""`, never `[]`. |
+| `recipient`      | `details` of a conceal/generate response    | Echo of the sanitized `recipient` values submitted with the request. Always an array, `[]` when none was submitted, in every version. Not obscured — `details.recipient_safe` is the obscured form. |
+| `recipient_name` | receipt record                             | Display name of the configured Incoming recipient. Set only on `source: "incoming"` receipts; null for standard secrets.                                                                            |
+
+`show_recipients` is a convenience boolean on the receipt: true when `recipients` is non-empty.
+
+### A requested `ttl` is clamped, not rejected
+
+The `ttl` submitted when creating a secret is a request, not a guarantee. An out-of-range value is silently adjusted and the secret is created with the adjusted value, so clients should read the effective TTL back from the response (`secret_ttl` on the receipt) rather than assume the requested value was honored.
+
+* **Canonical-host guests are capped at 7 days by default.** This is the policy for unaccountable traffic creating against the platform's own storage boundary. Self-hosted operators can raise or lower it via `TTL_MAX_ANONYMOUS` (config key `site.secret_options.ttl_max_anonymous`). On billing-enabled deployments the free-tier `secret_lifetime` limit is an additional ceiling.
+* **Custom-domain guests use the domain owner's organization policy instead.** Although the caller is unauthenticated, the tenant owns the storage boundary. The effective ceiling is normally 14 days for a free organization or 30 days for an organization with extended expiration, still bounded by the configured `ttl_options` maximum and the 365-day software-safety limit.
+* A value below the configured minimum is raised to that minimum.
+* Authenticated callers are governed separately. A free-tier request above 14 days is *rejected* with an entitlement error rather than clamped, so the caller gets an explicit upgrade path instead of a shortened secret.
+
+## OpenAPI Definitions
+
+Generated OpenAPI definitions are available at:
+- `generated/openapi/openapi.v1.json`
+- `generated/openapi/openapi.v2.json`
+- `generated/openapi/openapi.v3.json`
+
+Run `pnpm run openapi:generate` to regenerate from source schemas.
 
 ---
 

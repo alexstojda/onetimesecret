@@ -1,4 +1,12 @@
 // src/types/ui/notifications.ts
 
-import type { ErrorSeverity } from '@/schemas/errors';
-export type NotificationSeverity = ErrorSeverity | 'success' | null;
+/**
+ * Notification types
+ *
+ * Re-exports from schemas. Types are defined in schemas/ui/notifications.ts.
+ */
+
+export type {
+  NotificationAlignment,
+  NotificationSeverity,
+} from '@/schemas/ui/notifications';

@@ -1,33 +1,68 @@
 # apps/api/v1/logic/base.rb
+#
+# frozen_string_literal: true
 
-require 'stathat'
 require 'timeout'
 
-require 'onetime/refinements/rack_refinements'
 require_relative 'helpers'
+require 'onetime/security/input_sanitizers'
+require 'onetime/application/authorization_policies'
 
 module V1
   module Logic
     class Base
-      include V1::Logic::I18nHelpers
-      include V1::Logic::UriHelpers
+      using Familia::Refinements::TimeLiterals
 
-      attr_reader :sess, :cust, :params, :locale, :processed_params, :plan
+      include Onetime::LoggerMethods
+      include V1::Logic::UriHelpers
+      include Onetime::Security::InputSanitizers
+
+      # AuthorizationPolicies supplies the shared authorization/entitlement
+      # predicates (anonymous_user?, has_system_role?, verify_*!) mixed into
+      # every other API logic base (Onetime::Logic::Base, colonel/, organizations/,
+      # domains/). It is included here as forward-looking foundation for ADR-012
+      # Stage 3 entitlement enforcement in V1.
+      #
+      # NOTE (currently dormant in V1): these helpers are not yet called from V1
+      # logic. require_entitlement! lives in Onetime::Logic::Base — NOT in this
+      # module — and V1::Logic::Base does not inherit from it, so V1's only
+      # entitlement gate (Secrets::BaseSecretAction) is guarded behind
+      # `respond_to?(:auth_org) && auth_org`, which is never true until V1 gains
+      # OrganizationContext. Keep the include so V1 stays aligned with the other
+      # logic bases; remove it only if the ADR-012 V1 rollout is abandoned.
+      include Onetime::Application::AuthorizationPolicies
+
+      attr_reader :sess, :cust, :params, :locale, :processed_params
       attr_reader :site, :authentication, :domains_enabled
 
       attr_accessor :domain_strategy, :display_domain
 
-      def initialize(sess, cust, params = nil, locale = nil)
-        @sess = sess
-        @cust = cust
-        @params = params
-        @locale = locale
+      def initialize(
+        sess,
+        cust,
+        params = nil,
+        locale = nil,
+        domain_strategy: nil,
+        display_domain: nil,
+        **keyword_params
+      )
+        # Ruby 3 treats a final string-keyed Hash as keywords once this
+        # initializer declares domain-context keywords. Preserve V1's legacy
+        # `new(session, customer, 'ttl' => '3600')` call shape.
+        params = keyword_params if params.nil? && !keyword_params.empty?
+
+        @sess            = sess
+        @cust            = cust
+        @params          = params
+        @locale          = locale
+        @domain_strategy = domain_strategy
+        @display_domain  = display_domain
         @processed_params ||= {} # TODO: Remove
         process_settings
 
         if cust.is_a?(String)
-          OT.li "[#{self.class}] Friendly reminder to pass in a Customer instance instead of a custid"
-          @cust = V1::Customer.load(cust)
+          logger.info "Friendly reminder to pass in a Customer instance instead of a custid", logic_class: self.class
+          @cust = Onetime::Customer.load_by_extid_or_email(cust)
         end
 
         # Won't run if params aren't passed in
@@ -35,22 +70,21 @@ module V1
       end
 
       def process_settings
-        @site = OT.conf.fetch(:site, {})
-        domains = site.fetch(:domains, {})
-        @authentication = site.fetch(:authentication, {})
-        domains = site.fetch(:domains, {})
-        @domains_enabled = domains[:enabled] || false
+        @site = OT.conf.fetch('site', {})
+        domains = site.fetch('domains', {})
+        @authentication = site.fetch('authentication', {})
+        domains = site.fetch('domains', {})
+        @domains_enabled = domains['enabled'] || false
       end
 
-      def valid_email?(guess)
-        OT.ld "[valid_email?] Guess: #{guess}"
+      def valid_email?(email_field)
+        logger.debug "[valid_email?] Email field", email_field: email_field
 
         begin
-          validator = Truemail.validate(guess)
+          validator = Truemail.validate(email_field)
 
         rescue StandardError => e
-          OT.le "Email validation error: #{e.message}"
-          OT.le e.backtrace
+          logger.error "Email validation error", exception: e
           false
         else
           valid = validator.result.valid?
@@ -71,65 +105,25 @@ module V1
       end
 
       def form_fields
-        OT.ld "No form_fields method for #{self.class} via:", caller[0..2].join("\n")
+        logger.debug "No form_fields method", logic_class: self.class, caller: caller[0..2]
         {}
       end
 
-      def raise_not_found(msg)
-        ex = Onetime::RecordNotFound.new
-        ex.message = msg
+      # Two call shapes (and a hybrid): see lib/onetime/logic/base.rb for documentation.
+      def raise_not_found(msg = nil, error_key: nil, args: {})
+        ex = Onetime::RecordNotFound.new(msg, error_key: error_key, args: args)
         raise ex
       end
 
-      def raise_form_error(msg)
-        ex = OT::FormError.new
-        ex.message = msg
+      def raise_form_error(msg = nil, error_key: nil, args: {}, field: nil, error_type: nil)
+        ex = OT::FormError.new(msg, error_key: error_key, args: args,
+                                    field: field, error_type: error_type)
         ex.form_fields = form_fields if respond_to?(:form_fields)
         raise ex
       end
 
-      def plan
-        @plan = Onetime::Plan.plan(cust.planid) unless cust.nil?
-        @plan ||= Onetime::Plan.plan('anonymous')
-        @plan
-      end
-
-      def limit_action(event)
-        disable_for_paid = plan && plan.paid?
-        # This method is called a lot so we don't even attempt to log unless we're debugging
-        OT.ld "[limit_action] #{event} (disable:#{disable_for_paid};sess:#{sess.class})" if OT.debug?
-        return if disable_for_paid
-        raise OT::Problem, "No session to limit" unless sess
-        sess.event_incr! event
-      end
-
       def custom_domain?
         domain_strategy.to_s == 'custom'
-      end
-
-      # Requires the implementing class to have cust and session fields
-      def send_verification_email token=nil
-      _, secret = V1::Secret.spawn_pair cust.custid, token
-
-        msg = "Thanks for verifying your account. We got you a secret fortune cookie!\n\n\"%s\"" % OT::Utils.random_fortune
-
-        secret.encrypt_value msg
-        secret.verification = true
-        secret.custid = cust.custid
-        secret.save
-
-        cust.reset_secret = secret.key # as a standalone rediskey, writes immediately
-
-        view = Onetime::Mail::Welcome.new cust, locale, secret
-
-        begin
-          view.deliver_email token
-
-        rescue StandardError => ex
-          errmsg = "Couldn't send the verification email. Let us know below."
-          OT.le "Error sending verification email: #{ex.message}", ex.backtrace
-          sess.set_info_message errmsg
-        end
       end
 
       module ClassMethods
@@ -140,50 +134,5 @@ module V1
 
       extend ClassMethods
     end
-
-    module ClassMethods
-      attr_writer :stathat_apikey, :stathat_enabled
-
-      def stathat_apikey
-        @stathat_apikey ||= Onetime.conf[:stathat][:apikey]
-      end
-
-      def stathat_enabled
-        return unless Onetime.conf.has_key?(:stathat)
-
-        @stathat_enabled = Onetime.conf[:stathat][:enabled] if @stathat_enabled.nil?
-        @stathat_enabled
-      end
-
-      def stathat_count(name, count, wait = 0.500)
-        return false unless stathat_enabled
-
-        begin
-          Timeout.timeout(wait) do
-            StatHat::API.ez_post_count(name, stathat_apikey, count)
-          end
-        rescue SocketError => e
-          OT.info "Cannot connect to StatHat: #{e.message}"
-        rescue Timeout::Error
-          OT.info 'timeout calling stathat'
-        end
-      end
-
-      def stathat_value(name, value, wait = 0.500)
-        return false unless stathat_enabled
-
-        begin
-          Timeout.timeout(wait) do
-            StatHat::API.ez_post_value(name, stathat_apikey, value)
-          end
-        rescue SocketError => e
-          OT.info "Cannot connect to StatHat: #{e.message}"
-        rescue Timeout::Error
-          OT.info 'timeout calling stathat'
-        end
-      end
-    end
-
-    extend ClassMethods
   end
 end

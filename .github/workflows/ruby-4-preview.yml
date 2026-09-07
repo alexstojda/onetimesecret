@@ -1,0 +1,262 @@
+# .github/workflows/ruby-4-preview.yml
+---
+name: Ruby 4 Preview
+
+# Standalone, non-blocking workflow that runs Ruby lint and tests under
+# Ruby 4.0.2 so the team can see what breaks before committing to the
+# upgrade. The Ruby-4-dependent steps are marked continue-on-error at
+# the step level, so failures surface as yellow warning annotations
+# (not red checks) and jobs still conclude green — visible signal
+# without blocking merge or polluting the PR check list.
+#
+# Design notes:
+# - Jobs are independent: each test job only needs build-assets for the
+#   frontend artifact, and uses `if: always()` so a failure in one job
+#   does not cascade into skipping others.
+# - Test jobs run through tests/lanes/run — the same entry point as
+#   ci.yml and local development — with services from compose.test.yml,
+#   so the only intended variable is the Ruby version. The lanes are
+#   invoked directly (not via the run-test-lane composite): this
+#   workflow is advisory, so the composite's failure-tail PR comments
+#   and results plumbing would be noise (gating and reporting policy is
+#   CI's per-workflow decision; tests/lanes/README.md rule 4).
+# - Artifacts are scoped per workflow run, so there is no collision with
+#   the main CI workflow's `frontend-build` artifact.
+# - `continue-on-error` is at the step level (not job level) on every
+#   step whose outcome depends on Ruby 4 gem compatibility. Any failure
+#   there — setup-ruby's bundle install, rubocop, or the lane run — is
+#   captured as a warning annotation on the step while the job itself
+#   completes successfully.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+      - 'rel/*'
+      - 'fix/*'
+      - 'feature/*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ruby4-preview-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-assets:
+    name: Ruby 4 · Build Frontend Assets
+    runs-on: &runs-on ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - &checkout-step
+        name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      - name: Build assets
+        run: pnpm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-build
+          path: public/web/dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  ruby-lint:
+    name: Ruby 4 · Lint
+    runs-on: *runs-on
+    timeout-minutes: 5
+    steps:
+      - *checkout-step
+
+      - name: Setup Ruby 4.0.2 (may fail on bundle install)
+        uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
+        continue-on-error: true
+        with:
+          ruby-version: '4.0.2'
+          bundler-cache: false # DEBUG: disabled to rule out stale cache
+
+      - name: Install dependencies
+        continue-on-error: true
+        run: bundle install --jobs 4 --retry 3
+
+      - name: Run Rubocop
+        continue-on-error: true
+        run: |
+          mkdir -p tmp
+          bundle exec rubocop --config .rubocop.yml \
+            --format progress \
+            --format json --out tmp/rubocop_results.json \
+            --fail-level warning
+
+      - name: Upload Rubocop results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ruby4-rubocop-results
+          path: tmp/rubocop_results.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+  ruby-unit:
+    name: Ruby 4 · Unit Tests
+    runs-on: *runs-on
+    timeout-minutes: 15
+    needs: [build-assets]
+    if: always()
+
+    steps:
+      - *checkout-step
+
+      # Services come from compose.test.yml — the same containers ci.yml
+      # and a local `tests/lanes/run` use.
+      - &start-core-services
+        name: Start test services (valkey, rabbitmq)
+        run: docker compose -f compose.test.yml up --wait -d valkey rabbitmq
+
+      - name: Setup Ruby test environment (may fail on bundle install)
+        uses: ./.github/actions/setup-ruby-test-env
+        continue-on-error: true
+        with:
+          ruby-version: '4.0.2'
+
+      # Locale + JSON-schema generation is owned by the lane's tasks file;
+      # it needs python3, node, and pnpm on PATH.
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      - name: Run unit lane (Ruby 4)
+        continue-on-error: true
+        env:
+          LANES_NO_AUTOSTART: '1'
+        run: tests/lanes/run unit
+
+  ruby-integration-simple:
+    name: Ruby 4 · Integration (Simple Mode)
+    runs-on: *runs-on
+    timeout-minutes: 15
+    needs: [build-assets]
+    if: always()
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment (may fail on bundle install)
+        uses: ./.github/actions/setup-ruby-test-env
+        continue-on-error: true
+        with:
+          ruby-version: '4.0.2'
+
+      - &setup-python-step
+        name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - &setup-node-step
+        name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - &install-pnpm-step
+        name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Run simple lane (Ruby 4)
+        continue-on-error: true
+        env:
+          LANES_NO_AUTOSTART: '1'
+        run: tests/lanes/run simple
+
+  ruby-integration-full:
+    name: 'Ruby 4 · Integration (Full, SQLite, billing: ${{ matrix.billing-enabled }})'
+    runs-on: *runs-on
+    timeout-minutes: 15
+    needs: [build-assets]
+    if: always()
+
+    # Same lane + overlay pairing as ci.yml's SQLite matrix rows; the
+    # billing rows are the full-sqlite lane with the billing overlay.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - billing-enabled: 'false'
+            overlay: ''
+          - billing-enabled: 'true'
+            overlay: 'billing'
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment (may fail on bundle install)
+        uses: ./.github/actions/setup-ruby-test-env
+        continue-on-error: true
+        with:
+          ruby-version: '4.0.2'
+
+      - *setup-python-step
+
+      - *setup-node-step
+
+      - *install-pnpm-step
+
+      - name: Run full-sqlite lane (Ruby 4)
+        continue-on-error: true
+        env:
+          LANES_NO_AUTOSTART: '1'
+          OVERLAY: ${{ matrix.overlay }}
+        run: |
+          args=(tests/lanes/run full-sqlite)
+          if [ -n "$OVERLAY" ]; then
+            args+=(--overlay "$OVERLAY")
+          fi
+          "${args[@]}"
+
+  ruby-integration-disabled:
+    name: Ruby 4 · Integration (Disabled Mode)
+    runs-on: *runs-on
+    timeout-minutes: 15
+    needs: [build-assets]
+    if: always()
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment (may fail on bundle install)
+        uses: ./.github/actions/setup-ruby-test-env
+        continue-on-error: true
+        with:
+          ruby-version: '4.0.2'
+
+      - *setup-python-step
+
+      - *setup-node-step
+
+      - *install-pnpm-step
+
+      - name: Run disabled lane (Ruby 4)
+        continue-on-error: true
+        env:
+          LANES_NO_AUTOSTART: '1'
+        run: tests/lanes/run disabled

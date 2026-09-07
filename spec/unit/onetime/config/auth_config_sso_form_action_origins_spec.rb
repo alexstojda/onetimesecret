@@ -1,0 +1,480 @@
+# spec/unit/onetime/config/auth_config_sso_form_action_origins_spec.rb
+#
+# frozen_string_literal: true
+
+require 'spec_helper'
+require 'tempfile'
+require 'fileutils'
+
+# Tests for AuthConfig#sso_form_action_origins — the boot-time set of SSO
+# identity-provider origins the CSP form-action directive must allow so the
+# SSO form POST that 302-redirects to the IdP is not blocked by Chromium.
+#
+# Provider-derived origins reuse #sso_providers' gate (SSO enabled + required
+# env vars present); SSO_FORM_ACTION_ORIGINS is merged in unconditionally.
+#
+# Strategy mirrors auth_config_spec.rb: write a minimal YAML config to a temp
+# file, point ConfigResolver at it, save/restore the touched env, and reset the
+# singleton between examples.
+#
+# Run: pnpm run test:rspec spec/unit/onetime/config/auth_config_sso_form_action_origins_spec.rb
+RSpec.describe Onetime::AuthConfig do
+  let(:temp_dir) { Dir.mktmpdir('auth_config_sso_origins_test') }
+  let(:config_path) { File.join(temp_dir, 'auth.yaml') }
+
+  # Minimal config: full mode, SSO feature gated on AUTH_SSO_ENABLED.
+  let(:base_yaml) do
+    <<~YAML
+      ---
+      mode: <%= ENV['AUTHENTICATION_MODE'] || 'full' %>
+      simple: {}
+      full:
+        database_url: "sqlite::memory:"
+        features:
+          verify_account: false
+          sso: <%= ENV['AUTH_SSO_ENABLED'] == 'true' %>
+        sso:
+          sso_display_name: ''
+    YAML
+  end
+
+  # ENV families the helper reads — saved and restored around each example.
+  let(:env_vars) do
+    %w[
+      AUTHENTICATION_MODE AUTH_SSO_ENABLED
+      OIDC_ISSUER OIDC_CLIENT_ID
+      ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET
+      GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET
+      GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET
+      SSO_FORM_ACTION_ORIGINS
+    ]
+  end
+
+  before(:each) do
+    @saved_env = env_vars.map { |k| [k, ENV[k]] }.to_h
+    env_vars.each { |k| ENV.delete(k) }
+    File.write(config_path, base_yaml)
+    allow(Onetime::Utils::ConfigResolver).to receive(:resolve)
+      .with('auth').and_return(config_path)
+  end
+
+  after(:each) do
+    @saved_env.each do |k, v|
+      v.nil? ? ENV.delete(k) : ENV[k] = v
+    end
+    described_class.instance_variable_set(:@singleton__instance__, nil)
+    FileUtils.rm_rf(temp_dir)
+  end
+
+  # Reset the singleton, re-render the ERB with the given env, return a fresh
+  # instance. AUTH_SSO_ENABLED defaults ON here so provider env vars actually
+  # gate a provider (SSO must be enabled for provider origins to appear).
+  def fresh_config(sso_enabled: true, **env_overrides)
+    ENV['AUTH_SSO_ENABLED'] = 'true' if sso_enabled
+    env_overrides.each { |k, v| ENV[k.to_s] = v }
+    described_class.instance_variable_set(:@singleton__instance__, nil)
+    File.write(config_path, base_yaml)
+    described_class.instance
+  end
+
+  describe '#sso_form_action_origins' do
+    it 'returns [] when nothing is configured' do
+      expect(fresh_config.sso_form_action_origins).to eq([])
+    end
+
+    # ── per-provider origins ─────────────────────────────────────────
+
+    it 'includes the Google origin when Google is active' do
+      config = fresh_config('GOOGLE_CLIENT_ID' => 'id', 'GOOGLE_CLIENT_SECRET' => 'secret')
+      expect(config.sso_form_action_origins).to contain_exactly('https://accounts.google.com')
+    end
+
+    it 'includes the GitHub origin when GitHub is active' do
+      config = fresh_config('GITHUB_CLIENT_ID' => 'id', 'GITHUB_CLIENT_SECRET' => 'secret')
+      expect(config.sso_form_action_origins).to contain_exactly('https://github.com')
+    end
+
+    it 'includes the (commercial-cloud) Entra origin when Entra is active' do
+      config = fresh_config(
+        'ENTRA_TENANT_ID' => 'tenant',
+        'ENTRA_CLIENT_ID' => 'id',
+        'ENTRA_CLIENT_SECRET' => 'secret',
+      )
+      expect(config.sso_form_action_origins).to contain_exactly('https://login.microsoftonline.com')
+    end
+
+    it 'derives the OIDC origin from OIDC_ISSUER' do
+      config = fresh_config('OIDC_ISSUER' => 'https://idp.example.com/realms/main', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to contain_exactly('https://idp.example.com')
+    end
+
+    it 'keeps a non-default port in the derived OIDC origin' do
+      config = fresh_config('OIDC_ISSUER' => 'https://idp.example.com:8443/x', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to contain_exactly('https://idp.example.com:8443')
+    end
+
+    it 'omits the default 443 port from the derived OIDC origin' do
+      config = fresh_config('OIDC_ISSUER' => 'https://idp.example.com:443/x', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to contain_exactly('https://idp.example.com')
+    end
+
+    # Non-TLS http is accepted on purpose: internal OIDC providers commonly run
+    # without TLS. Documents that origin_from_url keeps http, only rejecting
+    # non-http(s) schemes (see the ftp override case below).
+    it 'accepts a plain-http OIDC_ISSUER (internal non-TLS provider)' do
+      config = fresh_config('OIDC_ISSUER' => 'http://internal-idp.example.com', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to contain_exactly('http://internal-idp.example.com')
+    end
+
+    # ── malformed / blank OIDC issuer is tolerated ───────────────────
+
+    it 'tolerates a malformed OIDC_ISSUER by skipping it (no raise)' do
+      config = fresh_config('OIDC_ISSUER' => 'not a valid uri', 'OIDC_CLIENT_ID' => 'id')
+      expect { config.sso_form_action_origins }.not_to raise_error
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    it 'tolerates a schemeless OIDC_ISSUER by skipping it' do
+      config = fresh_config('OIDC_ISSUER' => 'idp.example.com', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    it 'skips OIDC when OIDC_ISSUER is blank (provider does not gate in)' do
+      config = fresh_config('OIDC_ISSUER' => '', 'OIDC_CLIENT_ID' => 'id')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    # URI.parse('https://') sets #host to '' (not nil), so the hostless-guard
+    # must treat an empty host as unresolvable — otherwise a degenerate
+    # bare-scheme "https://" origin leaks into the CSP form-action directive.
+    # The provider still gates in (OIDC_ISSUER is non-empty), so this exercises
+    # the origin-derivation guard, not the provider gate.
+    it 'skips OIDC (no bare-scheme origin) when OIDC_ISSUER is scheme-only "https://"' do
+      config = fresh_config('OIDC_ISSUER' => 'https://', 'OIDC_CLIENT_ID' => 'id')
+      expect { config.sso_form_action_origins }.not_to raise_error
+      origins = config.sso_form_action_origins
+      expect(origins).to eq([])
+      expect(origins).not_to include('https://')
+    end
+
+    it 'skips OIDC (no bare-scheme origin) when OIDC_ISSUER is hostless "https:///path"' do
+      config = fresh_config('OIDC_ISSUER' => 'https:///path', 'OIDC_CLIENT_ID' => 'id')
+      expect { config.sso_form_action_origins }.not_to raise_error
+      origins = config.sso_form_action_origins
+      expect(origins).to eq([])
+      expect(origins).not_to include('https://')
+    end
+
+    # ── multiple active providers ────────────────────────────────────
+
+    it 'collects origins from every active provider' do
+      config = fresh_config(
+        'GOOGLE_CLIENT_ID' => 'id', 'GOOGLE_CLIENT_SECRET' => 'secret',
+        'GITHUB_CLIENT_ID' => 'id', 'GITHUB_CLIENT_SECRET' => 'secret',
+      )
+      expect(config.sso_form_action_origins).to contain_exactly(
+        'https://accounts.google.com',
+        'https://github.com',
+      )
+    end
+
+    # ── SSO_FORM_ACTION_ORIGINS override ─────────────────────────────
+
+    it 'merges the space-separated SSO_FORM_ACTION_ORIGINS override' do
+      config = fresh_config(
+        'SSO_FORM_ACTION_ORIGINS' => 'https://login.microsoftonline.us https://sso.example.org',
+      )
+      expect(config.sso_form_action_origins).to contain_exactly(
+        'https://login.microsoftonline.us',
+        'https://sso.example.org',
+      )
+    end
+
+    it 'applies the override even with zero active providers' do
+      config = fresh_config(sso_enabled: false, 'SSO_FORM_ACTION_ORIGINS' => 'https://sso.example.org')
+      expect(config.sso_form_action_origins).to contain_exactly('https://sso.example.org')
+    end
+
+    it 'applies the override even in simple mode (independent of provider gating)' do
+      config = fresh_config(
+        sso_enabled: false,
+        'AUTHENTICATION_MODE' => 'simple',
+        'SSO_FORM_ACTION_ORIGINS' => 'https://sso.example.org',
+      )
+      expect(config.sso_form_action_origins).to contain_exactly('https://sso.example.org')
+    end
+
+    it 'de-duplicates when the override repeats a provider-derived origin' do
+      config = fresh_config(
+        'GOOGLE_CLIENT_ID' => 'id', 'GOOGLE_CLIENT_SECRET' => 'secret',
+        'SSO_FORM_ACTION_ORIGINS' => 'https://accounts.google.com',
+      )
+      expect(config.sso_form_action_origins).to contain_exactly('https://accounts.google.com')
+    end
+
+    # ── SSO_FORM_ACTION_ORIGINS override validation ──────────────────
+    # Override tokens are routed through origin_from_url and dropped unless they
+    # resolve to a clean http(s) origin. Unvalidated tokens would inject into
+    # the CSP form-action directive; otto's reject_injection! then 500s every
+    # request.
+
+    it 'drops a schemeless override token' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'login.microsoftonline.us')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    # KEY REGRESSION GUARD: a semicolon-injection value must never yield an
+    # origin token carrying ';'. URI.parse keeps the trailing ';' on the host,
+    # so the host guard in origin_from_url must reject it.
+    it 'never emits an origin containing a semicolon from an injection value' do
+      config = fresh_config(
+        'SSO_FORM_ACTION_ORIGINS' => 'https://idp.example.com; script-src https://evil.example',
+      )
+      origins = config.sso_form_action_origins
+      expect(origins).to all(satisfy { |o| !o.include?(';') })
+      expect(origins).not_to include('https://idp.example.com;')
+    end
+
+    it 'drops a non-http(s) override token (ftp)' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'ftp://files.example.com')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    # ── parity with otto's own extras validator ──────────────────────
+    # origin_from_url funnels its candidate through
+    # Otto::Security::CSP::RequestExtras.normalize_origin. A token this app
+    # accepts but otto later drops at policy-build time is the silent #4173
+    # failure: the operator gets a generic otto warning naming neither the
+    # source nor the record, and the redirect is blocked in the browser only.
+
+    it 'keeps an override token with a valid explicit port' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'https://idp.example.com:8443')
+      expect(config.sso_form_action_origins).to contain_exactly('https://idp.example.com:8443')
+    end
+
+    it 'drops an override token whose port is 0 (below otto\'s 1..65535 range)' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'https://idp.example.com:0')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    it 'drops an override token whose port is above 65535' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'https://idp.example.com:70000')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    it 'drops an override token whose host contains a percent-encoding' do
+      config = fresh_config('SSO_FORM_ACTION_ORIGINS' => 'https://idp%00.example.com')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+
+    it 'logs a token otto would have dropped, so the misconfiguration is visible' do
+      allow(OT).to receive(:lw)
+      fresh_config('SSO_FORM_ACTION_ORIGINS' => 'https://idp.example.com:70000')
+        .sso_form_action_origins
+      expect(OT).to have_received(:lw).with(/SSO_FORM_ACTION_ORIGINS token/)
+    end
+
+    it 'emits only origins otto would accept unchanged' do
+      origins    = fresh_config(
+        'OIDC_ISSUER' => 'https://idp.example.com:8443/realms/main',
+        'OIDC_CLIENT_ID' => 'id',
+        'SSO_FORM_ACTION_ORIGINS' => 'https://sso.example.org http://internal-idp:8080',
+      ).sso_form_action_origins
+      normalized = origins.map { |o| Otto::Security::CSP::RequestExtras.normalize_origin(o) }
+      expect(normalized).to eq(origins)
+    end
+
+    # ── SSO feature disabled ─────────────────────────────────────────
+
+    it 'ignores provider env vars when the SSO feature is disabled' do
+      config = fresh_config(sso_enabled: false, 'GOOGLE_CLIENT_ID' => 'id', 'GOOGLE_CLIENT_SECRET' => 'secret')
+      expect(config.sso_form_action_origins).to eq([])
+    end
+  end
+
+  # The per-request complement (#4173): Onetime::Middleware::TenantCspExtras
+  # feeds a tenant's CustomDomain::SsoConfig through this funnel to widen the
+  # CSP form-action directive for that request only. The issuer is
+  # tenant-supplied (attacker-influenced), so every oidc value must survive
+  # origin_from_url or resolve to nil.
+  describe '#tenant_idp_origin' do
+    def tenant_sso_config(provider_type:, issuer: nil)
+      double('CustomDomain::SsoConfig', provider_type: provider_type, issuer: issuer)
+    end
+
+    # ── oidc: issuer-derived through origin_from_url ─────────────────
+
+    it 'extracts the issuer origin for an oidc config, stripping the path' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example/realms/main')
+      expect(fresh_config.tenant_idp_origin(config)).to eq('https://idp.tenant.example')
+    end
+
+    it 'preserves a non-default port in the oidc issuer origin' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example:8443/x')
+      expect(fresh_config.tenant_idp_origin(config)).to eq('https://idp.tenant.example:8443')
+    end
+
+    it 'omits the default 443 port from the oidc issuer origin' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example:443/x')
+      expect(fresh_config.tenant_idp_origin(config)).to eq('https://idp.tenant.example')
+    end
+
+    it 'strips a bare trailing slash (otto extras reject any path, even "/")' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example/')
+      expect(fresh_config.tenant_idp_origin(config)).to eq('https://idp.tenant.example')
+    end
+
+    # ── oidc: malformed / hostile issuers resolve to nil, never raise ─
+
+    it 'returns nil for a blank issuer' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: '')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for a nil issuer' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: nil)
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for a schemeless issuer' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'idp.tenant.example')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for a non-http(s) issuer (javascript:)' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'javascript:alert(1)')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil (never a token with ";") for a semicolon-injection issuer' do
+      config = tenant_sso_config(
+        provider_type: 'oidc',
+        issuer: 'https://idp.tenant.example; script-src https://evil.example',
+      )
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil (no raise) for an unparseable issuer' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'not a valid uri')
+      instance = fresh_config
+      expect { instance.tenant_idp_origin(config) }.not_to raise_error
+      expect(instance.tenant_idp_origin(config)).to be_nil
+    end
+
+    # ── issuers otto would drop must be rejected HERE ─────────────────
+    # An issuer that clears this funnel but fails otto's own sanitizer is
+    # dropped at policy-build time with a warning naming neither the domain
+    # nor the SsoConfig record — TenantCspExtras only reaches
+    # warn_rejected_origin_source when the origin comes back nil, so the
+    # rejection must happen here for the operator to hear about it (#4173).
+
+    it 'returns nil for an issuer whose port is 0 (below otto\'s 1..65535 range)' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example:0/realms/x')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for an issuer whose port is above 65535' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp.tenant.example:70000/realms/x')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for an issuer whose host contains a percent-encoding' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://idp%00.tenant.example/realms/x')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    # RHS is otto's OWN normalization of the expected origin: if otto would
+    # reject or rewrite this value, the two sides diverge and this fails.
+    it 'returns an origin otto would accept unchanged' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://IDP.Tenant.Example:8443/realms/x')
+      expect(fresh_config.tenant_idp_origin(config)).to eq(
+        Otto::Security::CSP::RequestExtras.normalize_origin('https://idp.tenant.example:8443'),
+      )
+    end
+
+    # ── entra_id: static registry origin ─────────────────────────────
+
+    it 'returns the registry commercial-cloud origin for entra_id, ignoring any issuer' do
+      config = tenant_sso_config(provider_type: 'entra_id', issuer: 'https://sts.windows.net/tenant/')
+      expect(fresh_config.tenant_idp_origin(config))
+        .to eq(Onetime::SsoProvider::Entra::DEFINITION[:idp_origin])
+      expect(fresh_config.tenant_idp_origin(config)).to eq('https://login.microsoftonline.com')
+    end
+
+    # ── everything else ──────────────────────────────────────────────
+
+    it 'returns nil for an unknown provider_type' do
+      config = tenant_sso_config(provider_type: 'github', issuer: 'https://github.com')
+      expect(fresh_config.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil (no raise) when a mapped provider has no registry definition' do
+      # Guards route-map/registry drift: a PROVIDER_ROUTE_MAP entry whose
+      # route has no SsoProvider::Registry definition must answer nil per
+      # request — Registry.fetch would raise KeyError, which is right for
+      # boot-time typos but would 500 the CSP middleware path.
+      stub_const(
+        'Onetime::CustomDomain::SsoConfig::PROVIDER_ROUTE_MAP',
+        Onetime::CustomDomain::SsoConfig::PROVIDER_ROUTE_MAP.merge(
+          'future_idp' => { env_var: 'FUTURE_ROUTE_NAME', default: 'future' },
+        ),
+      )
+      config = tenant_sso_config(provider_type: 'future_idp')
+      instance = fresh_config
+      expect { instance.tenant_idp_origin(config) }.not_to raise_error
+      expect(instance.tenant_idp_origin(config)).to be_nil
+    end
+
+    it 'returns nil for a nil sso_config' do
+      expect(fresh_config.tenant_idp_origin(nil)).to be_nil
+    end
+  end
+
+  # The dispatch #tenant_idp_origin runs internally, exposed because
+  # Onetime::Middleware::TenantCspExtras needs to tell "the tenant typed a bad
+  # issuer" (operator-fixable, worth a warning) apart from registry drift (a
+  # deploy bug, where naming the issuer would name the wrong cause). Pinned
+  # here so the two callers cannot drift apart silently.
+  describe '#tenant_origin_source' do
+    def tenant_sso_config(provider_type:, issuer: nil)
+      double('CustomDomain::SsoConfig', provider_type: provider_type, issuer: issuer)
+    end
+
+    it 'returns the stripped issuer for an issuer-derived provider type' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: '  https://idp.example.com/x  ')
+      expect(fresh_config.tenant_origin_source(config)).to eq('https://idp.example.com/x')
+    end
+
+    it 'returns the raw hostile issuer unfiltered (validation is the funnel\'s job)' do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: 'https://a.example; script-src *')
+      instance = fresh_config
+      expect(instance.tenant_origin_source(config)).to eq('https://a.example; script-src *')
+      expect(instance.tenant_idp_origin(config)).to be_nil
+    end
+
+    it "returns '' for an issuer-derived type whose issuer is unset" do
+      config = tenant_sso_config(provider_type: 'oidc', issuer: nil)
+      expect(fresh_config.tenant_origin_source(config)).to eq('')
+    end
+
+    it 'returns nil for a registry-derived provider type, even with an issuer set' do
+      config = tenant_sso_config(provider_type: 'entra_id', issuer: 'https://stale.example.com')
+      expect(fresh_config.tenant_origin_source(config)).to be_nil
+    end
+
+    it 'returns nil for an unknown provider type and for a nil sso_config' do
+      instance = fresh_config
+      expect(instance.tenant_origin_source(tenant_sso_config(provider_type: 'nope'))).to be_nil
+      expect(instance.tenant_origin_source(nil)).to be_nil
+    end
+
+    it 'covers every issuer-derived type declared in the constant' do
+      # Guards the drift this method exists to prevent: a type added to
+      # ISSUER_DERIVED_PROVIDER_TYPES must actually read the record's issuer.
+      described_class::ISSUER_DERIVED_PROVIDER_TYPES.each do |provider_type|
+        config = tenant_sso_config(provider_type: provider_type, issuer: 'https://idp.example.com')
+        expect(fresh_config.tenant_origin_source(config)).to eq('https://idp.example.com')
+      end
+    end
+  end
+end

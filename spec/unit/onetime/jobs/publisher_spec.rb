@@ -1,0 +1,1105 @@
+# spec/unit/onetime/jobs/publisher_spec.rb
+#
+# frozen_string_literal: true
+
+require 'spec_helper'
+require 'onetime/jobs/publisher'
+require 'onetime/operations/validate_sender_domain'
+
+RSpec.describe Onetime::Jobs::Publisher do
+  describe 'class methods' do
+    it 'responds to enqueue_email' do
+      expect(described_class).to respond_to(:enqueue_email)
+    end
+
+    it 'responds to enqueue_email_raw' do
+      expect(described_class).to respond_to(:enqueue_email_raw)
+    end
+
+    it 'responds to schedule_email' do
+      expect(described_class).to respond_to(:schedule_email)
+    end
+  end
+
+  describe 'instance methods' do
+    subject(:publisher) { described_class.new }
+
+    it 'responds to enqueue_email' do
+      expect(publisher).to respond_to(:enqueue_email)
+    end
+
+    it 'responds to schedule_email' do
+      expect(publisher).to respond_to(:schedule_email)
+    end
+
+    it 'responds to publish' do
+      expect(publisher).to respond_to(:publish)
+    end
+  end
+
+  describe 'constants' do
+    it 'defines FALLBACK_STRATEGIES with valid options' do
+      expect(described_class::FALLBACK_STRATEGIES).to eq(%i[async_thread sync raise none])
+    end
+
+    it 'defines DEFAULT_FALLBACK as :async_thread' do
+      expect(described_class::DEFAULT_FALLBACK).to eq(:async_thread)
+    end
+  end
+
+  describe '#publish with RabbitMQ' do
+    subject(:publisher) { described_class.new }
+
+    it 'includes message_id in UUID format when publishing' do
+      mock_channel = instance_double(Bunny::Channel)
+      mock_exchange = instance_double(Bunny::Exchange)
+      mock_channel_pool = instance_double(ConnectionPool)
+
+      allow(mock_channel_pool).to receive(:with).and_yield(mock_channel)
+      allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+      allow(mock_exchange).to receive(:publish)
+
+      $rmq_channel_pool = mock_channel_pool
+
+      publisher.publish('test.queue', { data: 'test' })
+
+      expect(mock_exchange).to have_received(:publish) do |payload, options|
+        expect(options[:message_id]).to match(/^[0-9a-f-]{36}$/)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Sentry Distributed Tracing Tests
+  # ==========================================================================
+  # These tests verify that Sentry trace headers are correctly extracted
+  # from the current request context and included in published messages
+  # for distributed tracing across RabbitMQ message boundaries.
+  # ==========================================================================
+
+  describe 'trace header propagation' do
+    subject(:publisher) { described_class.new }
+
+    let(:mock_channel) { instance_double(Bunny::Channel) }
+    let(:mock_exchange) { instance_double(Bunny::Exchange) }
+    let(:mock_channel_pool) { instance_double(ConnectionPool) }
+
+    before do
+      allow(mock_channel_pool).to receive(:with).and_yield(mock_channel)
+      allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+      allow(mock_exchange).to receive(:publish)
+      $rmq_channel_pool = mock_channel_pool
+
+      # Stub Sentry module for tests if not defined
+      unless defined?(Sentry)
+        stub_const('Sentry', Module.new do
+          def self.initialized?
+            false
+          end
+
+          def self.get_current_scope
+            nil
+          end
+
+          def self.get_trace_propagation_headers
+            nil
+          end
+        end)
+      end
+    end
+
+    after do
+      $rmq_channel_pool = nil
+    end
+
+    context 'when Sentry has active trace context' do
+      let(:trace_headers) do
+        {
+          'sentry-trace' => '00-abcd1234-5678ef90-01',
+          'baggage' => 'sentry-environment=production,sentry-release=1.0.0'
+        }
+      end
+
+      before do
+        allow(Onetime::Jobs::TracePropagation).to receive(:extract_trace_headers).and_return(trace_headers)
+      end
+
+      it 'includes sentry-trace header in published message headers' do
+        publisher.publish('test.queue', { data: 'test' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['sentry-trace']).to eq('00-abcd1234-5678ef90-01')
+        end
+      end
+
+      it 'includes baggage header in published message headers' do
+        publisher.publish('test.queue', { data: 'test' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['baggage']).to eq('sentry-environment=production,sentry-release=1.0.0')
+        end
+      end
+
+      it 'merges trace headers with schema version header' do
+        publisher.publish('test.queue', { data: 'test' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          headers = options[:headers]
+          expect(headers['x-schema-version']).to eq(Onetime::Jobs::QueueConfig::CURRENT_SCHEMA_VERSION)
+          expect(headers['sentry-trace']).not_to be_nil
+          expect(headers['baggage']).not_to be_nil
+        end
+      end
+
+      it 'propagates trace headers via enqueue_email' do
+        publisher.enqueue_email(:secret_link, { secret_key: 'abc' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['sentry-trace']).to eq('00-abcd1234-5678ef90-01')
+        end
+      end
+
+      it 'propagates trace headers via schedule_email' do
+        publisher.schedule_email(:secret_link, { secret_key: 'abc' }, delay_seconds: 60)
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['sentry-trace']).to eq('00-abcd1234-5678ef90-01')
+        end
+      end
+
+      it 'propagates trace headers via enqueue_email_raw' do
+        raw_email = { to: 'test@example.com', from: 'noreply@example.com', subject: 'Test', body: 'Hello' }
+        publisher.enqueue_email_raw(raw_email)
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['sentry-trace']).to eq('00-abcd1234-5678ef90-01')
+        end
+      end
+    end
+
+    context 'when Sentry has no active trace context' do
+      before do
+        allow(Onetime::Jobs::TracePropagation).to receive(:extract_trace_headers).and_return({})
+      end
+
+      it 'publishes message without trace headers' do
+        publisher.publish('test.queue', { data: 'test' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]).not_to have_key('sentry-trace')
+          expect(options[:headers]).not_to have_key('baggage')
+        end
+      end
+
+      it 'still includes schema version header' do
+        publisher.publish('test.queue', { data: 'test' })
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          expect(options[:headers]['x-schema-version']).to eq(Onetime::Jobs::QueueConfig::CURRENT_SCHEMA_VERSION)
+        end
+      end
+    end
+
+    context 'when Sentry is not initialized' do
+      before do
+        allow(Sentry).to receive(:initialized?).and_return(false)
+        # Let the actual module handle this - it should return empty hash
+        allow(Onetime::Jobs::TracePropagation).to receive(:extract_trace_headers).and_call_original
+      end
+
+      it 'publishes message successfully without trace headers' do
+        expect {
+          publisher.publish('test.queue', { data: 'test' })
+        }.not_to raise_error
+
+        expect(mock_exchange).to have_received(:publish) do |_payload, options|
+          # Schema version should still be present
+          expect(options[:headers]['x-schema-version']).not_to be_nil
+        end
+      end
+    end
+  end
+
+  describe '#enqueue_email without RabbitMQ' do
+    subject(:publisher) { described_class.new }
+
+    before do
+      $rmq_channel_pool = nil
+    end
+
+    context 'with fallback: :sync' do
+      it 'falls back to synchronous email delivery' do
+        allow(Onetime::Mail).to receive(:deliver)
+
+        publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+        expect(Onetime::Mail).to have_received(:deliver).with(:welcome, { email: 'test@example.com' }, sender_config: nil)
+      end
+
+      # Regression for #3486: a :sync delivery failure (e.g. unreachable SMTP)
+      # must not raise out of the publisher. The caller has already persisted
+      # its record, so blocking-and-delivering should degrade gracefully rather
+      # than 500 the request. Contrast with :raise, which propagates.
+      context 'when synchronous delivery fails' do
+        let(:delivery_error) do
+          Onetime::Mail::DeliveryError.new('SMTP unreachable', transient: true)
+        end
+
+        before do
+          allow(Onetime::Mail).to receive(:deliver).and_raise(delivery_error)
+        end
+
+        it 'does not raise to the caller' do
+          expect {
+            publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+          }.not_to raise_error
+        end
+
+        it 'returns false (fallback used, not queued)' do
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(result).to be false
+        end
+
+        it 'routes the failure to out-of-band reporting (log + Sentry)' do
+          # Stubbed as a no-op so the assertion is independent of Sentry/logger
+          # state in the test env; the helper's contents are exercised separately.
+          allow(publisher).to receive(:report_delivery_failure)
+
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(publisher).to have_received(:report_delivery_failure).with(delivery_error, :templated, :sync)
+        end
+      end
+
+      # Narrowed rescue (PR #3545 review): only Onetime::Mail::DeliveryError is
+      # swallowed. A non-delivery error (e.g. a template bug) is a programming
+      # fault and must propagate so it surfaces in dev/test/CI instead of the
+      # request silently "succeeding".
+      it 'propagates a non-delivery error instead of swallowing it' do
+        allow(Onetime::Mail).to receive(:deliver).and_raise(NoMethodError.new("undefined method 'foo'"))
+
+        expect {
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+        }.to raise_error(NoMethodError)
+      end
+    end
+
+    context 'with fallback: :async_thread (default)' do
+      it 'spawns a thread for email delivery' do
+        delivered = Concurrent::AtomicBoolean.new(false)
+        allow(Onetime::Mail).to receive(:deliver) { delivered.make_true }
+
+        # Default fallback spawns a thread
+        publisher.enqueue_email(:welcome, { email: 'test@example.com' })
+
+        # Wait for thread to complete with timeout
+        Timeout.timeout(5) { sleep 0.05 until delivered.true? }
+
+        expect(Onetime::Mail).to have_received(:deliver).with(:welcome, { email: 'test@example.com' }, sender_config: nil)
+      end
+    end
+
+    context 'with fallback: :none' do
+      it 'does not attempt to send email' do
+        allow(Onetime::Mail).to receive(:deliver)
+
+        publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :none)
+
+        expect(Onetime::Mail).not_to have_received(:deliver)
+      end
+    end
+
+    context 'with fallback: :raise' do
+      it 'raises DeliveryError' do
+        expect {
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :raise)
+        }.to raise_error(Onetime::Mail::DeliveryError, /RabbitMQ unavailable/)
+      end
+    end
+
+    context 'with invalid fallback strategy' do
+      it 'raises ArgumentError' do
+        expect {
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :invalid)
+        }.to raise_error(ArgumentError, /Invalid fallback strategy/)
+      end
+    end
+  end
+
+  describe '#enqueue_email_raw without RabbitMQ' do
+    subject(:publisher) { described_class.new }
+
+    before do
+      $rmq_channel_pool = nil
+    end
+
+    let(:raw_email) { { to: 'test@example.com', from: 'noreply@example.com', subject: 'Test', body: 'Hello' } }
+
+    context 'with fallback: :sync' do
+      it 'falls back to synchronous raw email delivery' do
+        allow(Onetime::Mail).to receive(:deliver_raw)
+
+        publisher.enqueue_email_raw(raw_email, fallback: :sync)
+
+        expect(Onetime::Mail).to have_received(:deliver_raw).with(raw_email, sender_config: nil)
+      end
+
+      # Regression for #3486: the Rodauth delivery hook uses enqueue_email_raw
+      # with fallback: :sync. An unreachable SMTP host must not surface as a 500.
+      it 'does not raise when synchronous raw delivery fails' do
+        allow(Onetime::Mail).to receive(:deliver_raw)
+          .and_raise(Onetime::Mail::DeliveryError.new('SMTP unreachable', transient: true))
+
+        result = nil
+        expect {
+          result = publisher.enqueue_email_raw(raw_email, fallback: :sync)
+        }.not_to raise_error
+        expect(result).to be false
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Fallback Delivery Reporting Tests
+  # ==========================================================================
+  # report_delivery_failure is the shared log + Sentry sink for the best-effort
+  # :sync and :async_thread strategies. It must record the failure without
+  # raising, and only touch Sentry when it is initialized.
+  # ==========================================================================
+
+  describe '#report_delivery_failure' do
+    subject(:publisher) { described_class.new }
+
+    let(:error) { Onetime::Mail::DeliveryError.new('SMTP unreachable', transient: true) }
+    let(:logger_double) { double('logger', error: nil) }
+
+    before do
+      allow(publisher).to receive(:logger).and_return(logger_double)
+      # Sentry is require: false; ensure a constant exists with the methods we
+      # stub (self-methods so verify_partial_doubles is satisfied). Default to
+      # not-initialized for determinism across environments.
+      stub_const('Sentry', Module.new do
+        def self.initialized?; end
+
+        def self.capture_exception(_exception); end
+      end)
+      allow(Sentry).to receive(:initialized?).and_return(false)
+      allow(Sentry).to receive(:capture_exception)
+    end
+
+    it 'logs the failure at error level and does not raise' do
+      expect {
+        publisher.send(:report_delivery_failure, error, :templated, :sync)
+      }.not_to raise_error
+
+      expect(logger_double).to have_received(:error).with(
+        'Fallback email delivery failed',
+        hash_including(mode: :sync, email_type: :templated, error: 'SMTP unreachable')
+      )
+    end
+
+    it 'does not capture to Sentry when it is not initialized' do
+      publisher.send(:report_delivery_failure, error, :templated, :sync)
+
+      expect(Sentry).not_to have_received(:capture_exception)
+    end
+
+    context 'when Sentry is initialized' do
+      let(:scope) { double('Sentry::Scope', set_tags: nil, set_context: nil) }
+
+      before do
+        allow(Sentry).to receive(:initialized?).and_return(true)
+        allow(Sentry).to receive(:capture_exception).and_yield(scope)
+      end
+
+      it 'captures the exception with component tags and email context' do
+        publisher.send(:report_delivery_failure, error, :raw, :async_thread)
+
+        expect(Sentry).to have_received(:capture_exception).with(error)
+        expect(scope).to have_received(:set_tags).with(component: 'jobs.publisher', fallback: :async_thread)
+        expect(scope).to have_received(:set_context).with('email_delivery', { email_type: :raw })
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Domain ID Threading Tests
+  # ==========================================================================
+  # These tests verify that domain_id is correctly included in published
+  # message payloads and threaded through to fallback delivery paths.
+  # ==========================================================================
+
+  describe 'domain_id threading' do
+    subject(:publisher) { described_class.new }
+
+    describe '#enqueue_email with RabbitMQ' do
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+      let(:mock_exchange) { instance_double(Bunny::Exchange) }
+      let(:mock_channel_pool) { instance_double(ConnectionPool) }
+
+      before do
+        allow(mock_channel_pool).to receive(:with).and_yield(mock_channel)
+        allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+        allow(mock_exchange).to receive(:publish)
+        $rmq_channel_pool = mock_channel_pool
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      it 'includes domain_id in published message payload when provided' do
+        publisher.enqueue_email(:secret_link, { secret_key: 'abc' }, domain_id: 'dom_xyz789')
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:domain_id]).to eq('dom_xyz789')
+          expect(payload[:template]).to eq('secret_link')
+          expect(payload[:data]).to eq({ secret_key: 'abc' })
+        end
+      end
+
+      it 'includes nil domain_id when not provided (backward compat)' do
+        publisher.enqueue_email(:secret_link, { secret_key: 'abc' })
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:domain_id]).to be_nil
+        end
+      end
+
+      it 'includes domain_id in scheduled email payload' do
+        publisher.schedule_email(:secret_link, { secret_key: 'abc' }, delay_seconds: 60, domain_id: 'dom_sched')
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:domain_id]).to eq('dom_sched')
+          expect(options[:expiration]).to eq('60000')
+        end
+      end
+
+      it 'includes domain_id in raw email payload' do
+        raw_email = { to: 'user@example.com', from: 'noreply@example.com', subject: 'Test', body: 'Body' }
+        publisher.enqueue_email_raw(raw_email, domain_id: 'dom_raw123')
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:domain_id]).to eq('dom_raw123')
+          expect(payload[:raw]).to be true
+        end
+      end
+    end
+
+    describe 'fallback delivery with domain_id' do
+      before do
+        $rmq_channel_pool = nil
+      end
+
+      context 'with fallback: :sync and domain_id' do
+        it 'loads sender_config and passes it to Mail.deliver' do
+          mock_config = instance_double(
+            Onetime::CustomDomain::MailerConfig,
+            domain_id: 'dom_fallback',
+            from_address: 'custom@fallback.example.com',
+            enabled?: true,
+            verified?: true
+          )
+          allow(Onetime::CustomDomain::MailerConfig)
+            .to receive(:find_by_domain_id)
+            .with('dom_fallback')
+            .and_return(mock_config)
+          allow(Onetime::Mail).to receive(:deliver)
+
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync, domain_id: 'dom_fallback')
+
+          expect(Onetime::Mail).to have_received(:deliver).with(:welcome, { email: 'test@example.com' }, sender_config: mock_config)
+        end
+      end
+
+      context 'with fallback: :sync and no domain_id' do
+        it 'passes nil sender_config to Mail.deliver' do
+          allow(Onetime::Mail).to receive(:deliver)
+
+          publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(Onetime::Mail).to have_received(:deliver).with(:welcome, { email: 'test@example.com' }, sender_config: nil)
+        end
+      end
+
+      context 'with fallback: :sync for raw email with domain_id' do
+        it 'loads sender_config and passes it to Mail.deliver_raw' do
+          mock_config = instance_double(
+            Onetime::CustomDomain::MailerConfig,
+            domain_id: 'dom_rawfb',
+            from_address: 'custom@rawfb.example.com',
+            enabled?: true,
+            verified?: true
+          )
+          allow(Onetime::CustomDomain::MailerConfig)
+            .to receive(:find_by_domain_id)
+            .with('dom_rawfb')
+            .and_return(mock_config)
+          allow(Onetime::Mail).to receive(:deliver_raw)
+
+          raw_email = { to: 'user@example.com', from: 'noreply@example.com', subject: 'Test', body: 'Body' }
+          publisher.enqueue_email_raw(raw_email, fallback: :sync, domain_id: 'dom_rawfb')
+
+          expect(Onetime::Mail).to have_received(:deliver_raw).with(raw_email, sender_config: mock_config)
+        end
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Chaos/Failure Injection Tests
+  # ==========================================================================
+  # These tests verify behavior during mid-operation failures such as
+  # connection drops, pool exhaustion, and network errors.
+  # ==========================================================================
+
+  describe 'chaos/failure scenarios' do
+    subject(:publisher) { described_class.new }
+
+    describe 'channel pool exhaustion' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      context 'when ConnectionPool::TimeoutError occurs' do
+        before do
+          allow(mock_pool).to receive(:with).and_raise(ConnectionPool::TimeoutError.new('Timed out waiting for connection'))
+        end
+
+        it 'triggers fallback for enqueue_email with default strategy' do
+          delivered = Concurrent::AtomicBoolean.new(false)
+          allow(Onetime::Mail).to receive(:deliver) { delivered.make_true }
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' })
+
+          # Fallback returns false, but spawns thread for delivery
+          expect(result).to be false
+          Timeout.timeout(5) { sleep 0.05 until delivered.true? }
+          expect(Onetime::Mail).to have_received(:deliver)
+        end
+
+        it 'raises with fallback: :raise' do
+          expect {
+            publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :raise)
+          }.to raise_error(Onetime::Mail::DeliveryError, /RabbitMQ unavailable/)
+        end
+
+        it 'delivers synchronously with fallback: :sync' do
+          allow(Onetime::Mail).to receive(:deliver)
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(result).to be false
+          expect(Onetime::Mail).to have_received(:deliver)
+        end
+
+        # Regression for #3486: even when RabbitMQ is unavailable AND the sync
+        # fallback delivery itself fails, :sync must not raise to the caller.
+        it 'does not raise when the sync fallback delivery also fails' do
+          allow(Onetime::Mail).to receive(:deliver)
+            .and_raise(Onetime::Mail::DeliveryError.new('SMTP unreachable', transient: true))
+
+          result = nil
+          expect {
+            result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+          }.not_to raise_error
+          expect(result).to be false
+        end
+      end
+    end
+
+    describe 'connection closed mid-publish' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      context 'when Bunny::ConnectionClosedError occurs during publish' do
+        before do
+          allow(mock_pool).to receive(:with).and_yield(mock_channel)
+          allow(mock_channel).to receive(:default_exchange).and_raise(Bunny::ConnectionClosedError.new(nil))
+        end
+
+        it 'triggers fallback with default strategy' do
+          delivered = Concurrent::AtomicBoolean.new(false)
+          allow(Onetime::Mail).to receive(:deliver) { delivered.make_true }
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' })
+
+          expect(result).to be false
+          Timeout.timeout(5) { sleep 0.05 until delivered.true? }
+          expect(Onetime::Mail).to have_received(:deliver)
+        end
+
+        it 'respects fallback: :none by not delivering' do
+          allow(Onetime::Mail).to receive(:deliver)
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :none)
+
+          expect(result).to be false
+          expect(Onetime::Mail).not_to have_received(:deliver)
+        end
+      end
+
+      context 'when Bunny::NetworkFailure occurs during publish' do
+        before do
+          mock_exchange = instance_double(Bunny::Exchange)
+          allow(mock_pool).to receive(:with).and_yield(mock_channel)
+          allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+          # NetworkFailure requires (message, cause)
+          allow(mock_exchange).to receive(:publish).and_raise(Bunny::NetworkFailure.new('Network unreachable', nil))
+        end
+
+        it 'triggers fallback' do
+          allow(Onetime::Mail).to receive(:deliver)
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(result).to be false
+          expect(Onetime::Mail).to have_received(:deliver)
+        end
+      end
+    end
+
+    describe 'unexpected errors during publish' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+      let(:mock_exchange) { instance_double(Bunny::Exchange) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+        allow(mock_pool).to receive(:with).and_yield(mock_channel)
+        allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      context 'when an unexpected StandardError occurs' do
+        before do
+          allow(mock_exchange).to receive(:publish).and_raise(StandardError.new('Unexpected error'))
+        end
+
+        it 'still triggers fallback (caught by rescue StandardError)' do
+          allow(Onetime::Mail).to receive(:deliver)
+
+          result = publisher.enqueue_email(:welcome, { email: 'test@example.com' }, fallback: :sync)
+
+          expect(result).to be false
+          expect(Onetime::Mail).to have_received(:deliver)
+        end
+      end
+    end
+
+    describe '#publish without pool' do
+      before do
+        $rmq_channel_pool = nil
+      end
+
+      it 'raises Onetime::Problem with descriptive message' do
+        expect {
+          publisher.publish('some.queue', { data: 'test' })
+        }.to raise_error(Onetime::Problem, /RabbitMQ channel pool not initialized/)
+      end
+    end
+
+    describe 'fallback thread error handling' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+        allow(mock_pool).to receive(:with).and_raise(Bunny::ConnectionClosedError.new(nil))
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      context 'when async_thread fallback delivery itself fails' do
+        it 'does not raise to caller (fire-and-forget)' do
+          attempted = Concurrent::AtomicBoolean.new(false)
+          allow(Onetime::Mail).to receive(:deliver) do
+            attempted.make_true
+            raise StandardError.new('SMTP connection failed')
+          end
+
+          # The fallback spawns a thread that may fail, but the caller should not see it
+          expect {
+            publisher.enqueue_email(:welcome, { email: 'test@example.com' })
+          }.not_to raise_error
+
+          # Wait for thread to attempt delivery (will fail silently)
+          Timeout.timeout(5) { sleep 0.05 until attempted.true? }
+        end
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Billing Event Fallback Tests
+  # ==========================================================================
+  # These tests verify billing event publishing behavior when jobs are
+  # disabled or RabbitMQ is unavailable.
+  # ==========================================================================
+
+  describe '#enqueue_billing_event' do
+    subject(:publisher) { described_class.new }
+
+    let(:mock_event) do
+      instance_double(Stripe::Event, id: 'evt_123', type: 'invoice.paid')
+    end
+    let(:payload) { '{"id":"evt_123","type":"invoice.paid"}' }
+
+    # Note: The 'jobs disabled' synchronous fallback test is skipped because
+    # Billing::Operations::ProcessWebhookEvent is loaded dynamically and
+    # defining stub modules in unit tests is fragile. This path is covered
+    # by integration tests.
+    #
+    # See: spec/integration/all/jobs/rabbitmq_publishing_spec.rb for full coverage
+
+    context 'when RabbitMQ is available' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+      let(:mock_exchange) { instance_double(Bunny::Exchange) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+        allow(mock_pool).to receive(:with).and_yield(mock_channel)
+        allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+        allow(mock_exchange).to receive(:publish)
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      it 'publishes to billing.event.process queue' do
+        result = publisher.enqueue_billing_event(mock_event, payload)
+
+        expect(result).to be true
+        expect(mock_exchange).to have_received(:publish) do |message_json, options|
+          message = JSON.parse(message_json, symbolize_names: true)
+          expect(message[:event_id]).to eq('evt_123')
+          expect(message[:event_type]).to eq('invoice.paid')
+          expect(message[:payload]).to eq(payload)
+          expect(options[:routing_key]).to eq('billing.event.process')
+        end
+      end
+
+      it 'includes received_at timestamp in message' do
+        Timecop.freeze(Time.utc(2025, 1, 15, 12, 0, 0)) do
+          publisher.enqueue_billing_event(mock_event, payload)
+
+          expect(mock_exchange).to have_received(:publish) do |message_json, _options|
+            message = JSON.parse(message_json, symbolize_names: true)
+            expect(message[:received_at]).to eq('2025-01-15T12:00:00Z')
+          end
+        end
+      end
+    end
+
+    context 'when RabbitMQ connection fails mid-publish' do
+      let(:mock_pool) { instance_double(ConnectionPool) }
+
+      before do
+        $rmq_channel_pool = mock_pool
+        allow(mock_pool).to receive(:with).and_raise(Bunny::ConnectionClosedError.new(nil))
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      it 'raises error (billing events do not use fallback)' do
+        # Unlike email, billing events raise on RabbitMQ failure when jobs are enabled
+        # This ensures Stripe retries the webhook
+        expect {
+          publisher.enqueue_billing_event(mock_event, payload)
+        }.to raise_error(Bunny::ConnectionClosedError)
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Domain Validation bypass_cache Tests
+  # ==========================================================================
+  # These tests verify that bypass_cache is correctly included in published
+  # message payloads and passed through to the sync fallback path.
+  # ==========================================================================
+
+  describe '#enqueue_domain_validation bypass_cache' do
+    subject(:publisher) { described_class.new }
+
+    describe 'with RabbitMQ' do
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+      let(:mock_exchange) { instance_double(Bunny::Exchange) }
+      let(:mock_channel_pool) { instance_double(ConnectionPool) }
+
+      before do
+        allow(mock_channel_pool).to receive(:with).and_yield(mock_channel)
+        allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+        allow(mock_exchange).to receive(:publish)
+        $rmq_channel_pool = mock_channel_pool
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      it 'includes bypass_cache: true in message payload when provided' do
+        publisher.enqueue_domain_validation('dom_123', bypass_cache: true)
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:bypass_cache]).to eq(true)
+          expect(payload[:domain_id]).to eq('dom_123')
+        end
+      end
+
+      it 'includes bypass_cache: false in message payload when explicitly false' do
+        publisher.enqueue_domain_validation('dom_456', bypass_cache: false)
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:bypass_cache]).to eq(false)
+        end
+      end
+
+      it 'defaults bypass_cache to false when not provided' do
+        publisher.enqueue_domain_validation('dom_789')
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:bypass_cache]).to eq(false)
+        end
+      end
+    end
+
+    describe 'sync fallback with bypass_cache' do
+      let(:mock_config) do
+        instance_double(
+          Onetime::CustomDomain::MailerConfig,
+          domain_id: 'dom_sync',
+        )
+      end
+
+      before do
+        $rmq_channel_pool = nil
+        allow(Onetime::CustomDomain::MailerConfig).to receive(:find_by_domain_id).and_return(mock_config)
+      end
+
+      it 'passes bypass_cache: true to ValidateSenderDomain operation' do
+        mock_operation = instance_double(Onetime::Operations::ValidateSenderDomain)
+        allow(mock_operation).to receive(:call)
+        allow(Onetime::Operations::ValidateSenderDomain).to receive(:new).and_return(mock_operation)
+
+        publisher.enqueue_domain_validation('dom_sync', bypass_cache: true)
+
+        expect(Onetime::Operations::ValidateSenderDomain).to have_received(:new).with(
+          mailer_config: mock_config,
+          persist: true,
+          bypass_cache: true,
+        )
+      end
+
+      it 'passes bypass_cache: false when not provided' do
+        mock_operation = instance_double(Onetime::Operations::ValidateSenderDomain)
+        allow(mock_operation).to receive(:call)
+        allow(Onetime::Operations::ValidateSenderDomain).to receive(:new).and_return(mock_operation)
+
+        publisher.enqueue_domain_validation('dom_sync')
+
+        expect(Onetime::Operations::ValidateSenderDomain).to have_received(:new).with(
+          mailer_config: mock_config,
+          persist: true,
+          bypass_cache: false,
+        )
+      end
+    end
+  end
+
+  # ==========================================================================
+  # Session Revocation Sweep Tests (#3810)
+  # ==========================================================================
+  # These tests verify the async full-sweep publish path and the synchronous
+  # fallback that runs the operation inline (with the untracked sweep AND the
+  # credential watermark enabled) when jobs are disabled.
+  # ==========================================================================
+
+  describe '#enqueue_session_revocation_sweep' do
+    subject(:publisher) { described_class.new }
+
+    let(:custid) { 'cust_extid_123' }
+    let(:session_id) { 'sid_current_456' }
+
+    describe 'with RabbitMQ' do
+      let(:mock_channel) { instance_double(Bunny::Channel) }
+      let(:mock_exchange) { instance_double(Bunny::Exchange) }
+      let(:mock_channel_pool) { instance_double(ConnectionPool) }
+
+      before do
+        allow(mock_channel_pool).to receive(:with).and_yield(mock_channel)
+        allow(mock_channel).to receive(:default_exchange).and_return(mock_exchange)
+        allow(mock_exchange).to receive(:publish)
+        $rmq_channel_pool = mock_channel_pool
+      end
+
+      after do
+        $rmq_channel_pool = nil
+      end
+
+      it 'publishes to the session.revoke.sweep queue with the payload keys' do
+        result = publisher.enqueue_session_revocation_sweep(custid, except_session_id: session_id)
+
+        expect(result).to be true
+        expect(mock_exchange).to have_received(:publish) do |payload_json, options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:custid]).to eq(custid)
+          expect(payload[:except_session_id]).to eq(session_id)
+          expect(payload[:requested_at]).not_to be_nil
+          expect(options[:routing_key]).to eq('session.revoke.sweep')
+        end
+      end
+
+      it 'publishes persistent messages with a UUID message_id' do
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(mock_exchange).to have_received(:publish) do |_payload_json, options|
+          expect(options[:persistent]).to be true
+          expect(options[:message_id]).to match(/^[0-9a-f-]{36}$/)
+        end
+      end
+
+      it 'includes a nil except_session_id when not provided (revoke ALL)' do
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(mock_exchange).to have_received(:publish) do |payload_json, _options|
+          payload = JSON.parse(payload_json, symbolize_names: true)
+          expect(payload[:except_session_id]).to be_nil
+        end
+      end
+
+      # Security sweep: no email-style fallback machinery. If RabbitMQ dies
+      # mid-publish the error propagates so the caller can surface it.
+      it 'propagates publish errors to the caller (domain pattern, no fallback)' do
+        allow(mock_channel_pool).to receive(:with).and_raise(Bunny::ConnectionClosedError.new(nil))
+
+        expect {
+          publisher.enqueue_session_revocation_sweep(custid)
+        }.to raise_error(Bunny::ConnectionClosedError)
+      end
+    end
+
+    describe 'sync fallback when jobs are disabled' do
+      let(:mock_operation) do
+        instance_double(Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent)
+      end
+
+      # The inline branch reads the Result for outcome logging (worker parity),
+      # so the stub must return a real Data instance, not nil.
+      let(:op_result) do
+        Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent::Result.new(
+          revoked: true, blobs_deleted: 3, untracked_deleted: 1, scan_capped: false,
+        )
+      end
+
+      let(:capped_result) do
+        Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent::Result.new(
+          revoked: true, blobs_deleted: 5, untracked_deleted: 2, scan_capped: true,
+        )
+      end
+
+      let(:logger_double) { double('logger', info: nil, warn: nil, error: nil) }
+
+      before do
+        $rmq_channel_pool = nil
+        # The publisher requires the op lazily; load it here so the constant
+        # exists for the verified double.
+        require 'onetime/operations/sessions/revoke_all_for_customer_except_current'
+        allow(mock_operation).to receive(:call).and_return(op_result)
+        allow(Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent)
+          .to receive(:new).and_return(mock_operation)
+        allow(publisher).to receive(:logger).and_return(logger_double)
+      end
+
+      it 'runs the op inline with the full sweep and watermark enabled' do
+        result = publisher.enqueue_session_revocation_sweep(custid, except_session_id: session_id)
+
+        expect(result).to be true
+        expect(Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent)
+          .to have_received(:new).with(
+            custid: custid,
+            except_session_id: session_id,
+            scan_untracked: true,
+            honor_credential_watermark: true,
+          )
+        expect(mock_operation).to have_received(:call)
+      end
+
+      it 'passes a nil except_session_id through (revoke ALL)' do
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(Onetime::Operations::Sessions::RevokeAllForCustomerExceptCurrent)
+          .to have_received(:new).with(
+            custid: custid,
+            except_session_id: nil,
+            scan_untracked: true,
+            honor_credential_watermark: true,
+          )
+      end
+
+      # Worker parity: the inline fallback must surface the same outcomes the
+      # async worker logs, or a jobs-disabled deployment loses visibility.
+      it 'logs the outcome at info with the sweep counts' do
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(logger_double).to have_received(:info).with(
+          'Session revocation sweep complete',
+          hash_including(custid: custid, blobs_deleted: 3, untracked_deleted: 1),
+        )
+      end
+
+      it 'logs at ERROR when the scan was capped (an untracked blob may remain)' do
+        allow(mock_operation).to receive(:call).and_return(capped_result)
+
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(logger_double).to have_received(:error).with(
+          /scan cap/,
+          hash_including(custid: custid, blobs_deleted: 5, untracked_deleted: 2),
+        )
+        expect(logger_double).not_to have_received(:info)
+          .with(/sweep complete/i, anything)
+      end
+
+      it 'logs the inline fallback at WARN when jobs are configured ON but the pool is nil (degraded)' do
+        allow(OT).to receive(:conf).and_return('jobs' => { 'enabled' => true })
+
+        publisher.enqueue_session_revocation_sweep(custid)
+
+        expect(logger_double).to have_received(:warn).with(
+          /pool unavailable.*degraded/,
+          hash_including(custid: custid),
+        )
+      end
+    end
+  end
+end

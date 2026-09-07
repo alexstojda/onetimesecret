@@ -1,7 +1,13 @@
+# lib/middleware/detect_host.rb
+#
+# frozen_string_literal: true
+
+require 'ipaddr'
+require 'otto/env_keys'
+require 'rack/utils'
+require_relative 'logging'
+
 module Rack
-
-  require 'ipaddr'
-
   # Middleware to accurately detect the client's host in a Rack application.
   #
   # This middleware examines incoming HTTP requests and attempts to determine
@@ -24,12 +30,16 @@ module Rack
   # to accurately determine the host for proper URL generation, redirection,
   # and processing in multi-tenant applications.
   #
-  # This middleware prioritizes host detection in the following order:
+  # This middleware prioritizes host detection in the following order
+  # (mirroring HEADER_PRECEDENCE below):
   #
   # 1. `X-Forwarded-Host` - Commonly used by proxies and load balancers.
-  # 2. `X-Original-Host` - Used by various proxy services.
-  # 3. `Forwarded` - The standard header as per RFC 7239.
-  # 4. `Host` - Default HTTP host header.
+  # 2. `Apx-Incoming-Host` - Approximated.app custom-domain ingress.
+  # 3. `X-Original-Host` - Used by various proxy services.
+  # 4. `Forwarded` - RFC 7239 standard; the first `host=` parameter is
+  #    extracted (via `Rack::Utils.forwarded_values`), with quoted values
+  #    and ports handled per the RFC.
+  # 5. `Host` - Default HTTP host header.
   #
   # It also includes validation to filter out invalid or local hosts (e.g.,
   # `localhost`, `127.0.0.1`) and IP addresses, ensuring only legitimate
@@ -59,10 +69,32 @@ module Rack
   #
   # ### Security Considerations
   #
-  # Be cautious when trusting client-provided headers. Ensure that your
-  # infrastructure is configured to only allow trusted proxies to set these
-  # headers so that clients cannot spoof them. This middleware assumes that
-  # the headers come from trusted sources.
+  # **Trusted Proxy Validation**: This middleware only trusts forwarded host
+  # headers (X-Forwarded-Host, X-Original-Host, Apx-Incoming-Host, Forwarded)
+  # when the request arrived via a trusted reverse proxy. The otto trust key
+  # is TRI-STATE (otto#228) and, when present, authoritative in BOTH
+  # directions:
+  #
+  # - env['otto.via_trusted_proxy'] PRESENT — recorded by Otto's
+  #   IPPrivacyMiddleware (mounted earlier in the stack) from the ORIGINAL
+  #   connecting peer, before it rewrites REMOTE_ADDR to the resolved client
+  #   IP, and only when the operator configured proxy trust. true = the peer
+  #   matched a trusted-proxy CIDR (filter mode) or count-based depth mode
+  #   is active (configuring a depth asserts the peer is the proxy tier;
+  #   otto#226). false = trust IS configured and the peer failed it — an
+  #   authoritative deny; the heuristic below does not apply.
+  # - Key ABSENT — no proxy trust configured (or the otto middleware is not
+  #   mounted). Only then does the legacy heuristic apply: a private/
+  #   loopback REMOTE_ADDR grants trust, keeping self-hosted installs behind
+  #   a local reverse proxy working without any trusted-proxy config.
+  #
+  # A present-but-non-boolean value (a future otto surprise) is treated as
+  # untrusted rather than falling through to the heuristic: presence implies
+  # the authoritative contract. Direct requests from public IPs can only use
+  # the Host header.
+  #
+  # This prevents header spoofing attacks where malicious clients set
+  # X-Forwarded-Host to impersonate different hosts.
   #
   # ### Note on Rack's Default Behavior
   #
@@ -74,18 +106,37 @@ module Rack
   # by trusted components.
   #
   class DetectHost
+    include Middleware::Logging
+
     # NOTE: CF-Visitor header only contains scheme information { "scheme": "https" }
     # and is not used for host detection
     unless defined?(HEADER_PRECEDENCE)
-      # List of HTTP headers that might contain the host, in order of precedence.
-      # Headers earlier in the list are given priority over later ones.
-      HEADER_PRECEDENCE = [
+      # Forwarded headers that require trusted proxy validation.
+      # These headers can be spoofed by clients and are only trusted when
+      # otto's tri-state key grants it (otto.via_trusted_proxy == true) or,
+      # with the key absent (no proxy trust configured), when REMOTE_ADDR is
+      # a private/loopback address — see the trust decision in #call.
+      # Every header listed here is an implicit contract with the proxy
+      # tier: the trusted-proxy gate assumes the proxy overwrites or strips
+      # it, so an entry the proxy doesn't manage becomes a client spoofing
+      # vector THROUGH trusted infra (the example Caddyfile pins
+      # X-Original-Host but would pass an unlisted header untouched). That
+      # is why the IIS originals (X-Original-URL, X-Rewrite-URL) and
+      # X-Forwarded-Server (names the proxy itself) are absent — add a
+      # header only together with proxy-config guidance that sanitizes it.
+      # Scheme-only headers (X-Forwarded-Proto, CF-Visitor, ...) don't
+      # belong here either: this middleware detects hosts, not schemes.
+      FORWARDED_HEADERS = [
         'X-Forwarded-Host',   # Common proxy header (AWS ALB, nginx)
-        'Apx-Incoming-Host',  # Check Approximated (if it exists)
+        'Apx-Incoming-Host',  # Approximated-specific (approximated.app custom-domain ingress); like all forwarded headers, only honored behind trusted infra
         'X-Original-Host',    # Various proxy services
         'Forwarded',          # RFC 7239 standard (host parameter)
-        'Host',               # Default HTTP host header
-      ]
+      ].freeze
+
+      # List of HTTP headers that might contain the host, in order of precedence.
+      # Headers earlier in the list are given priority over later ones.
+      # NOTE: FORWARDED_HEADERS are only checked when request comes from trusted proxy.
+      HEADER_PRECEDENCE = (FORWARDED_HEADERS + ['Host']).freeze
 
       # Hostnames and IP addresses that should never be accepted as valid hosts.
       # These typically indicate local or development environments.
@@ -95,9 +146,12 @@ module Rack
         '127.0.0.1',
         '::1',
       ].freeze
-    end
 
-    attr_reader :logger
+      # Rack env key written by Otto's IPPrivacyMiddleware. Referenced from
+      # Otto::EnvKeys so a rename upstream has exactly one surface to update
+      # (previously a duplicated literal pinned by a tryout).
+      VIA_TRUSTED_PROXY_KEY = Otto::EnvKeys::VIA_TRUSTED_PROXY
+    end
 
     # Class-level setting initialized from ENV variable
     @result_field_name = ENV['DETECTED_HOST'] || 'rack.detected_host'
@@ -109,16 +163,16 @@ module Rack
     # Initializes the middleware with the application and logging options.
     #
     # @param app [#call] The Rack application
-    # @param io [IO] IO object for logging (defaults to stderr)
+    # @param logger [Logger, nil] Optional logger instance to use
     # @return [void]
-    def initialize(app, io: $stderr)
-      @app = app
-      log_level = ::Logger::INFO
-      # Override with DEBUG level only when conditions are met
-      if defined?(OT) && OT.respond_to?(:debug?) && OT.debug?
-        log_level = ::Logger::DEBUG
-      end
-      @logger = ::Logger.new(io, level: log_level)
+    def initialize(app, logger: nil)
+      @app           = app
+      @custom_logger = logger
+    end
+
+    # Override logger to allow custom logger injection
+    def logger
+      @custom_logger || super
     end
 
     # Processes the request and determines the appropriate host.
@@ -127,19 +181,69 @@ module Rack
     # @return [Array] Standard Rack response array from the next middleware
     #
     # This method:
-    # 1. Examines headers in order of precedence
-    # 2. Normalizes and validates each potential host
-    # 3. Accepts the first valid host found
-    # 4. Stores the result in env[result_field_name]
-    # 5. Passes the request to the next middleware
+    # 1. Determines if request is from a trusted proxy (otto's trusted-proxy
+    #    signal, or a private/loopback REMOTE_ADDR)
+    # 2. Examines headers in order of precedence (forwarded headers only from trusted proxies)
+    # 3. Normalizes and validates each potential host
+    # 4. Accepts the first valid host found
+    # 5. Stores the result in env[result_field_name]
+    # 6. Passes the request to the next middleware
     def call(env)
       result_field_name = self.class.result_field_name
-      detected_host = nil
+      detected_host     = nil
+
+      # Determine which headers to check based on whether request comes from
+      # a trusted proxy. Forwarded headers can be spoofed by clients, so they
+      # are only honored for requests that arrived via trusted infrastructure.
+      #
+      # The otto key is tri-state (otto#228); a PRESENT key is authoritative
+      # in both directions and the heuristic applies only when it is absent:
+      #
+      # a. Key present: otto's IPPrivacyMiddleware (mounted earlier in the
+      #    stack) recorded it from the ORIGINAL connecting peer — before
+      #    rewriting REMOTE_ADDR to the resolved client IP — and only
+      #    because the operator configured proxy trust (CIDR matchers, or a
+      #    depth: otto#226 grants depth-mode peer trust; the otto#151 remap
+      #    was dropped, so extra leftmost XFF entries never shift the
+      #    right-anchored selection; a chain shorter than the depth falls
+      #    back to the peer, and a depth larger than the real hop count
+      #    selects a client-supplied entry — each hop must append exactly
+      #    one entry and the origin must stay unreachable except through
+      #    the proxy tier). After the rewrite REMOTE_ADDR no
+      #    longer identifies the peer — with proxy trust enabled it holds
+      #    the real (public) visitor IP, so re-checking it here would
+      #    wrongly discard forwarded host headers and fail every custom
+      #    domain to canonical (2026-08-05 incident). A false key means the
+      #    configured trust REJECTED this peer — honoring the private-IP
+      #    heuristic anyway would let any request that resolves to a
+      #    private REMOTE_ADDR bypass the operator's explicit trust
+      #    decision. A present-but-non-boolean value (a future otto
+      #    surprise) is treated as untrusted: presence implies the
+      #    authoritative contract.
+      # b. Key absent: no proxy trust configured, or the otto middleware is
+      #    not mounted (bare-Rack stacks). Only here does the legacy
+      #    heuristic apply: a private/loopback REMOTE_ADDR grants trust,
+      #    keeping default-config self-hosted installs behind a local
+      #    reverse proxy (nginx/Caddy on the same box or LAN) working.
+      remote_addr        = env['REMOTE_ADDR']
+      from_trusted_proxy = if env.key?(VIA_TRUSTED_PROXY_KEY)
+        env[VIA_TRUSTED_PROXY_KEY] == true
+      else
+        self.class.private_ip?(remote_addr)
+      end
+
+      headers_to_check = if from_trusted_proxy
+        HEADER_PRECEDENCE
+      else
+        # Untrusted source: only the Host header is honored.
+        log_untrusted_request(env, remote_addr)
+        ['Host']
+      end
 
       # Try headers in order of precedence
-      HEADER_PRECEDENCE.each do |header|
+      headers_to_check.each do |header|
         header_key = "HTTP_#{header.tr('-', '_').upcase}"
-        host = self.class.normalize_host(env[header_key])
+        host       = self.class.normalize_host(env[header_key], forwarded: header == 'Forwarded')
         next if host.nil?
 
         if self.class.valid_domain_name?(host)
@@ -157,7 +261,7 @@ module Rack
 
       # Log indication if no valid host found in debug mode
       unless detected_host
-        logger.debug("[DetectHost] No valid host detected in request")
+        logger.debug('[DetectHost] No valid host detected in request')
       end
 
       # e.g. env['rack.detected_host'] = 'example.com'
@@ -168,23 +272,89 @@ module Rack
 
     private
 
+    # Logs why forwarded host headers are being ignored for this request,
+    # stating the actual trust inputs (the otto key's presence/value and the
+    # private_ip? result). REMOTE_ADDR is labeled post-proxy-resolution: by
+    # the time this middleware runs, IPPrivacyMiddleware may have rewritten
+    # it, so it does not necessarily identify the connecting peer.
+    #
+    # Escalates to WARN when Apx-Incoming-Host is among the discarded
+    # headers: Approximated ingress always sends it and a legitimate direct
+    # public client never does, so a discard here is the exact signature of
+    # the 2026-08-05 incident (custom domains falling back to canonical).
+    #
+    # @param env [Hash] Rack environment hash
+    # @param remote_addr [String, nil] env['REMOTE_ADDR'] after any rewrite
+    # @return [void]
+    def log_untrusted_request(env, remote_addr)
+      via_key      = env.key?(VIA_TRUSTED_PROXY_KEY) ? env[VIA_TRUSTED_PROXY_KEY].inspect : 'absent'
+      trust_inputs = "#{VIA_TRUSTED_PROXY_KEY}=#{via_key}, " \
+                     "private_ip=#{self.class.private_ip?(remote_addr)}, " \
+                     "remote_addr=#{remote_addr} (post-proxy-resolution)"
+
+      discarded    = FORWARDED_HEADERS.select do |header|
+        env.key?("HTTP_#{header.tr('-', '_').upcase}")
+      end
+
+      if discarded.empty?
+        logger.debug("[DetectHost] Untrusted source, no forwarded host headers present (#{trust_inputs})")
+      elsif discarded.include?('Apx-Incoming-Host')
+        logger.warn(
+          "[DetectHost] Discarding forwarded host headers (#{discarded.join(', ')}) " \
+          'from untrusted source; Apx-Incoming-Host present — matches the 2026-08-05 ' \
+          "Approximated-ingress incident signature (#{trust_inputs})",
+        )
+      else
+        logger.debug(
+          "[DetectHost] Discarding forwarded host headers (#{discarded.join(', ')}) " \
+          "from untrusted source (#{trust_inputs})",
+        )
+      end
+    end
+
     module ClassMethods
       # Extracts and normalizes the host from a header value.
       #
       # @param value_unsafe [String, nil] Raw header value from the request
+      # @param forwarded [Boolean] Whether the value uses RFC 7239 Forwarded syntax
       # @return [String, nil] Normalized host without port number, or nil if empty
       #
       # This method:
       # - Takes the first host if multiple are provided (comma-separated)
-      # - Removes any port numbers (e.g., example.com:8080 → example.com)
-      # - Converts to lowercase and removes surrounding whitespace
+      # - Extracts the first host parameter from RFC 7239 Forwarded values
+      # - Delegates to DomainParser for port stripping and normalization
       # - Returns nil for empty values
-      def normalize_host(value_unsafe)
-        host_with_port = value_unsafe.to_s.split(',').first.to_s
-        host = host_with_port.split(':').first.to_s.strip.downcase
-        return nil if host.empty?
-        host
+      def normalize_host(value_unsafe, forwarded: false)
+        first_host = if forwarded
+          forwarded_host(value_unsafe)
+        else
+          # Handle comma-separated hosts (e.g., X-Forwarded-Host header)
+          value_unsafe.to_s.split(',').first.to_s
+        end
+
+        # Delegate core normalization to DomainParser
+        Onetime::Utils::DomainParser.extract_hostname(first_host)
       end
+
+      # Extracts the first host parameter from an RFC 7239 Forwarded value.
+      #
+      # Parsing is delegated to Rack::Utils.forwarded_values, which handles
+      # quoted strings and escape sequences, bounds parameter and escape
+      # counts against denial of service, and fails closed (nil) on
+      # malformed input or unknown parameter names — letting the next header
+      # in the precedence list be considered. Element boundaries are
+      # flattened: the earliest host parameter anywhere in the header wins,
+      # mirroring the first-value convention used for X-Forwarded-Host.
+      def forwarded_host(value_unsafe)
+        case Rack::Utils.forwarded_values(value_unsafe)
+        in { host: [first_host, *] }
+          first_host
+        else
+          nil
+        end
+      end
+
+      private :forwarded_host
 
       # Determines if a string is a valid host for use in this application.
       #
@@ -192,11 +362,16 @@ module Rack
       # @return [Boolean] true if the host is a valid domain name
       #
       # Note: This method intentionally rejects IP addresses as we require
-      # domain names for our application's routing logic.
+      # domain names for our application's routing logic. It also requires
+      # DomainParser.basically_valid? (RFC 952/1123 charset, label and
+      # length limits) so header junk that survives extraction — control
+      # characters, quotes, semicolons — can never become the detected
+      # host. DomainStrategy applies the same gate after extraction.
       def valid_domain_name?(host)
         return false if INVALID_HOSTS.include?(host)
         return false if valid_ip?(host)
-        true
+
+        Onetime::Utils::DomainParser.basically_valid?(host)
       end
 
       # Determines if a string represents a private IP address.
@@ -221,9 +396,9 @@ module Rack
 
         # Check for private IPv6 ranges
         elsif ip.ipv6?
-          fc00 = IPAddr.new("fc00::/7")
-          fe80 = IPAddr.new("fe80::/10")
-          loopback = IPAddr.new("::1/128")
+          fc00     = IPAddr.new('fc00::/7')
+          fe80     = IPAddr.new('fe80::/10')
+          loopback = IPAddr.new('::1/128')
 
           return fc00.include?(ip) || # Unique Local Addresses
                  fe80.include?(ip) || # Link-local addresses

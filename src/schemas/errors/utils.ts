@@ -1,4 +1,5 @@
-// utils.ts - helper functions
+// src/schemas/errors/utils.ts
+
 import { errorGuards } from './guards';
 
 export function extractErrorDetails(error: unknown) {
@@ -10,7 +11,7 @@ export function extractErrorDetails(error: unknown) {
 
 function extractMessage(error: unknown): string {
   if (errorGuards.isHttpError(error)) {
-    return error.response?.data?.message || error.message || 'HTTP Error';
+    return error.response?.data?.error || error.message || 'HTTP Error';
   }
   return error instanceof Error ? error.message : String(error);
 }

@@ -1,0 +1,137 @@
+# etc/defaults/logging.defaults.yaml
+---
+# Onetime Secret - Logging Configuration
+#
+# Strategic categories for debugging and operational instrumentation:
+#   App       - Default fallback for application-level logging
+#   Auth      - Authentication/authorization flows
+#   Bunny     - RabbitMQ AMQP client (connection, heartbeats)
+#   Ents      - Plan materialization, grants/revokes, plan→permission application
+#   Familia   - Redis operations via Familia ORM
+#   HTTP      - HTTP requests, responses, and middleware
+#   Jobs      - Job publishing (enqueue_email, fallback handling)
+#   Org       - Organization + membership lifecycle (create/destroy/activate/cascade)
+#   Otto      - Otto framework operations
+#   Rhales    - Rhales template rendering (future)
+#   Scheduler - Scheduled/recurring background jobs (rufus-scheduler)
+#   Secret    - Core business value (create/view/burn)
+#   Sequel    - Database queries and operations
+#   Session   - Session lifecycle management
+#   Workers   - RabbitMQ worker message processing and orchestration
+#
+# Environment variable overrides:
+#   LOG_LEVEL=debug                       - Set global log level
+#   DEBUG_LOGGERS=Auth:debug,Secret:trace - Set specific logger levels
+#
+# There are quick debug flags for each named logger:
+#   DEBUG_AUTH=1                          - Quick debug flag for Auth
+#   DEBUG_BUNNY=1                         - Quick debug flag for Bunny (RabbitMQ)
+#   DEBUG_HTTP=1                          - Quick debug flag for HTTP
+#   ...
+#
+# For ad-hoc loggers that are not defined in the list below, use DEBUG_LOGGERS:
+#   DEBUG_LOGGERS=Sequel:debug,Rhales:trace
+#
+# External library debug flags (use library's own flags):
+#   FAMILIA_DEBUG=1                       - Familia's built-in debug flag
+#   FAMILIA_SAMPLE_RATE=0.01              - Familia command sampling (0.0-1.0)
+
+# Global default log level
+# Options: trace, debug, info, warn, error, fatal
+default_level: <%= ENV['DEFAULT_LOG_LEVEL'] || 'warn' %>
+
+# Output formatter
+# Options: color, json, default
+# - color: Human-readable with ANSI colors, timestamps, PID/thread (recommended)
+# - json: Structured JSON for production log shipping
+# - default: Plain text without colors
+formatter: <%= ENV['LOG_FORMATTER'] || 'color' %>
+
+# Named logger levels
+# Each category can be configured independently. Loggers added here are
+# made available by the setup_loggers initializer.
+loggers:
+  App: warn       # Default application logger
+  Auth: info      # Authentication/authorization flows
+  Billing: warn   # Stripe checkout, payment intents, subscription webhooks, invoices, plan catalog sync
+  Boot: warn      # During initialization
+  Bunny: warn     # RabbitMQ client (heartbeats at debug level)
+  Chores: info    # Familia::Horreum models housekeeping chores
+  Ents: info      # Entitlement materialization, grants/revokes, plan→permission application
+  Jobs: info      # Job publishing (Publisher.enqueue_email, fallbacks)
+  CLI: info       # Command-line interface operations
+  Familia: info   # Redis/Familia main database operations
+  HTTP: info      # HTTP requests and middleware operations
+  Org: info       # Organization + membership lifecycle (create/destroy/activate/cascade)
+  Otto: info      # Otto framework operations
+  Rhales: error   # Rhales template rendering (suppress unescaped HTML warnings)
+  Scheduler: info # Scheduled/recurring background jobs
+  Secret: info    # Secret lifecycle (create, view, burn)
+  Sequel: warn    # Database queries and operations (SQL logged at :trace level)
+  Session: info   # Session lifecycle (create, update, destroy)
+  Workers: info   # RabbitMQ worker message processing and orchestration
+
+# HTTP request logging configuration
+http:
+  # Set LOG_HTTP_REQUESTS=false to disable. Useful when running a reverse proxy
+  # which already logs requests and you consolidate logs into one stream to
+  # avoid redundant information.
+  enabled: <%= ENV['LOG_HTTP_REQUESTS'] != 'false' %>
+  # Overrides loggers.HTTP level for requests
+  level: <%= ENV['LOG_HTTP_REQUESTS_LEVEL'] || nil %>
+
+  # Capture mode determines what data is logged per request
+  # Options: minimal, standard, debug
+  #   minimal:  method, path, status, duration
+  #   standard: + request_id, ip
+  #   debug:    + params, headers, session_id
+  capture: <%= ENV['LOG_HTTP_CAPTURE'] || 'minimal' %>
+
+  # Opt-in allowlist of request field names (params or header display names,
+  # e.g. "ttl" or "User-Agent") that may appear in request/error logging
+  # beyond the baseline method/path/status/duration/request_id/ip. This is
+  # the one dial for both:
+  #   - :debug capture mode's params/headers above (empty = neither shows,
+  #     even with LOG_HTTP_CAPTURE=debug)
+  #   - what an unhandled exception / error report (Sentry) may attach from
+  #     the triggering request — see Onetime::ErrorHandler.safe_request_context
+  #
+  # Empty by default: a request that raises an unhandled exception is then
+  # logged with exactly the same fields as any other request (method, path,
+  # status) — the query string and request body are never logged. This
+  # mirrors Django's SafeExceptionReporterFilter stance: filtering is
+  # opt-in per field, not opt-out via a blocklist that can lag behind new
+  # sensitive field names.
+  #
+  # Header names must use the canonical capitalized-with-hyphens form (e.g.
+  # "User-Agent", "X-Forwarded-For") — each HTTP_ env key is normalized by
+  # capitalizing the parts between underscores, so an all-caps acronym like
+  # HTTP_CF_IPCOUNTRY normalizes to "Cf-Ipcountry", not "CF-IPCountry". If a
+  # header you add here doesn't seem to match, check the normalized form
+  # rather than what a browser or proxy sends on the wire.
+  #
+  # RequestLogger reads this list once at boot (its middleware instance is
+  # long-lived) — a change here takes effect on the next process restart,
+  # not a live config reload. Sentry's error-report context
+  # (Onetime::ErrorHandler.safe_request_context) re-reads it on every call,
+  # so the two surfaces can briefly disagree if you edit this without
+  # restarting.
+  #
+  # Never add names like password, secret, token, passphrase, api_key,
+  # access_token, refresh_token, Authorization, or Cookie here.
+  allowed_error_fields: <%= (ENV['LOG_HTTP_ALLOWED_ERROR_FIELDS'] || '').split(',').map(&:strip).reject(&:empty?) %>
+
+  # Threshold for logging slow requests as warnings (milliseconds)
+  slow_request_ms: <%= ENV['LOG_HTTP_SLOW_REQUEST_MS'] || 1000 %>
+
+  # Paths to ignore (glob patterns)
+  ignore_paths:
+    - /api/v1/status
+    - /api/v2/status
+    - /api/v3/status
+    - /health
+    - /healthcheck
+    - /favicon.ico
+    - /_vite/*
+    - /assets/*
+    - /dist/*

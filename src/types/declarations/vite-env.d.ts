@@ -1,5 +1,6 @@
-import type { Plugin } from 'rollup';
+// src/types/declarations/vite-env.d.ts
 
+import type { Plugin } from 'vite';
 
 /**
  * This file is here because:
@@ -36,6 +37,31 @@ import type { Plugin } from 'rollup';
 /// <reference types="vite/client" />
 
 /**
+ * Extend Vite's ImportMetaEnv interface to include our custom environment variables
+ * Note: Vite already provides BASE_URL, MODE, DEV, PROD, SSR in ImportMeta.env
+ */
+interface ImportMetaEnv {
+  readonly VITE_AUTH_URL?: string
+  readonly VITE_APP_TITLE?: string
+}
+
+/**
+ * Build-time constants injected by Vite define.
+ * These must be in a `declare global` block because this file
+ * is a module (has imports/exports).
+ */
+declare global {
+  /**
+   * Sentry release version baked at build time.
+   * Matches the commit hash used for sourcemap uploads, ensuring
+   * frontend errors can be correlated with the correct sourcemaps.
+   *
+   * @see vite.config.ts getSentryRelease()
+   */
+  const __SENTRY_RELEASE__: string;
+}
+
+/**
  * This part tells TypeScript how to understand .vue files.
  * It's like teaching TypeScript a new language (Vue).
  */
@@ -65,7 +91,6 @@ declare module '*.vue' {
    */
   export default component
 }
-
 
 // src/build/plugins/addTrailingNewline.d.ts
 export declare function addTrailingNewline(): Plugin;

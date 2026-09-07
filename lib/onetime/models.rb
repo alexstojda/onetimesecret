@@ -1,22 +1,42 @@
 # lib/onetime/models.rb
-
-# This file serves as a central loading point for all model classes across
-# different API versions. It provides a convenient way for external code to
-# access model classes without needing to understand the underlying version
-# structure.
 #
-# The CURRENT_API_VERSION constant allows test suites and application code to
-# reference the current API models without hardcoding specific version
-# dependencies throughout the codebase. This facilitates running the same
-# test suite against multiple API versions and simplifies version transitions.
+# frozen_string_literal: true
 
-require 'v1/models'
-require 'v2/models'
+require_relative 'models/features'
+require_relative 'models/secret'
+require_relative 'models/organization'
+require_relative 'models/organization_membership'
+require_relative 'models/customer'
+require_relative 'models/custom_domain'
+# Receipt must be loaded AFTER Organization and CustomDomain because
+# Receipt.participates_in declarations reference those classes
+require_relative 'models/receipt'
+require_relative 'models/feedback'
+require_relative 'models/colonel_audit_event'
+require_relative 'models/daily_metric'
+require_relative 'models/email_suppression'
+require_relative 'models/session_metadata'
+require_relative 'models/sso_link_challenge'
+require_relative 'models/sso_link_verification'
 
+# CustomDomain sibling configs — loaded after CustomDomain so the
+# nested-class reopens (`class CustomDomain; class ApiConfig; ...`)
+# resolve against the defined parent. Kept alphabetical.
+require_relative 'models/custom_domain/api_config'
+require_relative 'models/custom_domain/brand_settings'
+require_relative 'models/custom_domain/homepage_config'
+require_relative 'models/custom_domain/incoming_config'
+require_relative 'models/custom_domain/mailer_config'
+require_relative 'models/custom_domain/signin_config'
+require_relative 'models/custom_domain/signup_config'
+require_relative 'models/custom_domain/sso_config'
 
-module Onetime
-  # Points to the current API version's models module.
-  # Fixed to V2 for stability, but designed to be configurable in future
-  # iterations when dynamic version selection becomes necessary.
-  CURRENT_API_VERSION = V2
+# Catalog of the seven per-domain config kinds (colonel config endpoints).
+# Requires the config models above, so it loads after them.
+require_relative 'models/custom_domain/config_registry'
+
+# Housekeeping chores - loaded after models so chore DSL is available.
+# Sort for deterministic load order across platforms.
+Dir.glob(File.join(__dir__, 'models', '*', 'chores', '*.rb')).sort.each do |chore_file|
+  require chore_file
 end

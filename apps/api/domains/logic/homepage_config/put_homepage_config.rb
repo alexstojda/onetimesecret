@@ -1,0 +1,181 @@
+# apps/api/domains/logic/homepage_config/put_homepage_config.rb
+#
+# frozen_string_literal: true
+
+require 'onetime/models/custom_domain/homepage_config'
+require 'onetime/models/custom_domain/incoming_config'
+require_relative 'base'
+
+module DomainsAPI
+  module Logic
+    module HomepageConfig
+      # Create/Update Domain Homepage Configuration
+      #
+      # @api Creates or updates the homepage secrets configuration for a custom
+      #   domain. Sets the enabled state. Requires the requesting user to be an
+      #   organization owner with homepage_secrets entitlement.
+      #
+      # Request body (optional fields use merge/PATCH-style semantics — an
+      # omitted or null value leaves the stored value unchanged):
+      # - enabled: Boolean (required)
+      # - signup_enabled / signin_enabled: DEPRECATED, ignored (#3672). These
+      #   params once toggled the homepage auth links but carry no authority
+      #   anymore — per-domain auth links are governed by the SigninConfig /
+      #   SignupConfig settings (ADR-030). Submitting them logs a deprecation
+      #   warning and leaves the stored fields untouched. The response still
+      #   echoes the stored values (all false since the 2026-07-03 migration)
+      #   so read-modify-write clients keep round-tripping cleanly until the
+      #   fields are removed in a later release.
+      # - disabled_homepage_variant: String (optional) — gated-homepage variant
+      #   (closed | minimal | v1). null/omitted leaves it unchanged; "" resets it
+      #   to the deployment default; a recognised id sets it.
+      # - secrets_mode: String (optional) — which interactive experience the
+      #   enabled homepage presents ('create' | 'incoming'). null/omitted
+      #   leaves it unchanged. Setting 'incoming' requires the org to have the
+      #   incoming_secrets entitlement AND a ready IncomingConfig (enabled
+      #   with at least one recipient) — otherwise the homepage would present
+      #   a form with nowhere to deliver.
+      #
+      class PutHomepageConfig < Base
+        include Onetime::LoggerMethods
+
+        attr_reader :homepage_config
+
+        def process_params
+          @domain_id                 = sanitize_identifier(params['extid'])
+          @enabled                   = parse_boolean(params['enabled'])
+          # Deprecated no-ops (#3672): note their presence for the warning in
+          # process, but never parse or persist them — a homepage-form param
+          # must not be able to enable an auth surface.
+          @deprecated_auth_params    = %w[signup_enabled signin_enabled].select { |key| params.key?(key) }
+          @disabled_homepage_variant = params['disabled_homepage_variant']
+          @secrets_mode              = params['secrets_mode']&.to_s&.strip
+        end
+
+        def raise_concerns
+          raise_form_error('Authentication required', field: :user_id, error_type: :authentication_required) if cust.anonymous?
+          raise_form_error('Domain ID required', field: :domain_id, error_type: :missing) if @domain_id.to_s.empty?
+
+          authorize_domain_homepage!(@domain_id)
+
+          # `enabled` is the master switch and the only always-required field
+          # (the others are merge-semantic). Enforce its presence rather than
+          # letting a client that omits it silently DISABLE the homepage:
+          # parse_boolean(nil) is false, so an omitted field would otherwise
+          # read as "turn the homepage off". The request schema already
+          # requires it; this makes the server — the authoritative validator —
+          # reject the omission instead of trusting the caller.
+          raise_form_error('enabled is required', field: :enabled, error_type: :missing) if params['enabled'].nil?
+
+          validate_secrets_mode!
+        end
+
+        def process
+          logger.debug "[PutHomepageConfig] domain=#{@custom_domain.identifier} extid=#{@domain_id} " \
+                       "enabled=#{@enabled} org=#{@organization.identifier} user=#{cust.extid}"
+
+          if @deprecated_auth_params.any?
+            logger.warn "[PutHomepageConfig] deprecated params ignored (#{@deprecated_auth_params.join(', ')}) " \
+                        "domain=#{@custom_domain.identifier} user=#{cust.extid} — per-domain homepage auth " \
+                        'links are governed by the SigninConfig/SignupConfig settings, not this endpoint (#3672)'
+          end
+
+          @homepage_config = Onetime::CustomDomain::HomepageConfig.upsert(
+            domain_id: @custom_domain.identifier,
+            enabled: @enabled,
+            disabled_homepage_variant: @disabled_homepage_variant,
+            secrets_mode: @secrets_mode,
+          )
+
+          logger.debug "[PutHomepageConfig] saved domain=#{@custom_domain.identifier} " \
+                       "enabled=#{@homepage_config.enabled?} signup=#{@homepage_config.signup_enabled?} " \
+                       "signin=#{@homepage_config.signin_enabled?} " \
+                       "variant=#{@homepage_config.disabled_homepage_variant_value.inspect} " \
+                       "updated=#{@homepage_config.updated}"
+
+          success_data
+        end
+
+        def success_data
+          {
+            user_id: cust.extid,
+            record: {
+              domain_id: @homepage_config.domain_id,
+              enabled: @homepage_config.enabled?,
+              secrets_mode: @homepage_config.secrets_mode_value,
+              # Server-computed effective enablement (the bootstrap
+              # serializer's downgrade rule) so the admin frontend can
+              # mirror what anonymous visitors actually get without
+              # re-deriving readiness from possibly-stale client state.
+              effective_enabled: @homepage_config.effectively_enabled?(custom_domain: @custom_domain),
+              signup_enabled: @homepage_config.signup_enabled?,
+              signin_enabled: @homepage_config.signin_enabled?,
+              disabled_homepage_variant: @homepage_config.disabled_homepage_variant_value,
+              created_at: @homepage_config.created.to_i,
+              updated_at: @homepage_config.updated.to_i,
+            },
+          }
+        end
+
+        private
+
+        # Validate the optional secrets_mode param.
+        #
+        # nil = merge semantics, leave stored value unchanged — no checks.
+        # Anything else must be a recognised mode (strict rejection rather
+        # than the model's silent read-time coercion: silently collapsing a
+        # typo'd value to 'create' could switch ON the public create form on
+        # a domain that wanted incoming-only).
+        #
+        # 'incoming' additionally requires the incoming_secrets entitlement
+        # and a ready IncomingConfig. Readiness is only enforced when this
+        # request explicitly selects incoming mode: later drift (recipients
+        # removed, incoming disabled, or the org's incoming_secrets
+        # entitlement lapsing) is handled fail-closed at read time by the
+        # bootstrap serializer, so unrelated writes (e.g. auth-link toggles,
+        # or re-saving `enabled` without `secrets_mode` after a downgrade)
+        # never get stuck behind — or accidentally re-validate — a stored
+        # 'incoming' selection that's no longer available.
+        def validate_secrets_mode!
+          return if @secrets_mode.nil?
+
+          unless Onetime::CustomDomain::HomepageConfig::VALID_SECRETS_MODES.include?(@secrets_mode)
+            raise_form_error(
+              "Invalid secrets_mode: #{@secrets_mode}",
+              error_key: 'api.domains.errors.homepage_secrets_mode_invalid',
+              args: { secrets_mode: @secrets_mode },
+              field: :secrets_mode,
+              error_type: :invalid,
+            )
+          end
+
+          return unless @secrets_mode == 'incoming'
+
+          # Custom-domain incoming is governed by the org's incoming_secrets
+          # entitlement, NOT the install-wide features.incoming.enabled flag
+          # (which gates the canonical domain only). Mirrors
+          # authorize_domain_incoming! (incoming_config/base.rb) and the
+          # canonical/custom split in RecipientResolver.
+          unless @organization.can?('incoming_secrets')
+            raise_form_error(
+              'Incoming secrets mode requires the incoming_secrets entitlement. Please upgrade your plan.',
+              error_key: 'api.domains.errors.homepage_incoming_entitlement_required',
+              field: :secrets_mode,
+              error_type: :forbidden,
+            )
+          end
+
+          incoming = Onetime::CustomDomain::IncomingConfig.find_by_domain_id(@custom_domain.identifier)
+          return if incoming&.ready?
+
+          raise_form_error(
+            'Incoming secrets must be enabled with at least one recipient before it can be used as the homepage.',
+            error_key: 'api.domains.errors.homepage_incoming_not_ready',
+            field: :secrets_mode,
+            error_type: :invalid,
+          )
+        end
+      end
+    end
+  end
+end

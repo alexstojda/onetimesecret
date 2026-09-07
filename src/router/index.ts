@@ -1,25 +1,74 @@
-import { setupRouterGuards } from '@/router/guards.routes';
-import NotFound from '@/views/NotFound.vue';
+// src/router/index.ts
+
+import NotFound from '@/shared/components/errors/ErrorNotFound.vue';
 import type { Router, RouteRecordRaw } from 'vue-router';
 import { createRouter, createWebHistory } from 'vue-router';
 
-import accountRoutes from './account.routes';
-import authRoutes from './auth.routes';
-import dashboardRoutes from './dashboard.routes';
-import metadataRoutes from './metadata.routes';
-import productRoutes from './product.routes';
-import publicRoutes from './public.routes';
-import secretRoutes from './secret.routes';
+// App-specific routes
+import secretRoutes from '@/apps/secret/routes';
+import sessionRoutes from '@/apps/session/routes';
+import workspaceRoutes from '@/apps/workspace/routes';
 
-const routes: RouteRecordRaw[] = [
-  ...publicRoutes,
-  ...productRoutes,
-  ...metadataRoutes,
-  ...secretRoutes,
-  ...authRoutes,
-  ...dashboardRoutes,
-  ...accountRoutes,
-];
+// Cross-cutting routes
+import { installPiiQueryDevWarning } from './piiQueryGuard';
+import publicRoutes from './public.routes';
+
+/**
+ * Verifiable Identifier Format
+ *
+ * Distinguishes a verifiable identifier segment from a named path segment
+ * (e.g., `/abc/:id` vs `/abc/items`).
+ *
+ * A base-36 verifiable identifier is always exactly 62 characters
+ * (320 bits: 256-bit random + 64-bit HMAC tag), encoded with `[0-9a-z]`.
+ * Named segments are never this length, so length alone is a reliable discriminant.
+ *
+ * The frontend cannot verify the HMAC (the secret is server-side only), but can
+ * perform the same plausibility check used by `plausible_identifier?` on the backend:
+ *
+ * ```ts
+ * const VERIFIABLE_ID_RE = /^[0-9a-z]{62}$/;
+ *
+ * function isVerifiableId(segment: string): boolean {
+ *   return VERIFIABLE_ID_RE.test(segment);
+ * }
+ * ```
+ *
+ * Use this to branch route rendering — e.g. render a resource view when
+ * the segment matches, a collection/action view otherwise. Treat it as a
+ * format check only; the backend performs HMAC verification before authorizing.
+ *
+ * Routes containing verifiable identifiers (secrets, receipts) use the default
+ * `sentryScrubParams` behavior (scrub all params). Routes with safe params
+ * (product names, plan codes) explicitly opt out with `sentryScrubParams: false`.
+ *
+ * @see RouteMeta.sentryScrubParams in src/types/router.ts
+ */
+export const VERIFIABLE_ID_RE = /^[0-9a-z]{62}$/;
+
+export function isVerifiableId(segment: string): boolean {
+  return VERIFIABLE_ID_RE.test(segment);
+}
+
+/**
+ * Route loading order - determines precedence for route matching.
+ * More specific routes should come before catch-all patterns.
+ */
+// The colonel/admin console is served by its own isolated bundle (`src/admin.ts`
+// + `createAdminRouter`), NOT by this customer router. `/colonel` is handled
+// entirely by the admin app; the customer route graph must not carry it (that
+// would drag admin code back into the customer bundle — the epic's bundle
+// isolation invariant).
+const routeOrder = ['public', 'session', 'secret', 'workspace'] as const;
+
+const routeMap: Record<(typeof routeOrder)[number], RouteRecordRaw[]> = {
+  public: publicRoutes,
+  session: sessionRoutes,
+  secret: secretRoutes,
+  workspace: workspaceRoutes,
+};
+
+const routes: RouteRecordRaw[] = routeOrder.flatMap((key) => routeMap[key]);
 
 /**
  * Creates and configures the Vue Router instance.
@@ -61,11 +110,15 @@ export function createAppRouter(): Router {
     routes: [
       ...routes,
       // This catch-all 404 route is meant to be added last.
+      // Note: Default scrubbing is enabled (sentryScrubParams omitted) because
+      // pathMatch captures the full path which may contain sensitive tokens
+      // from expired/mistyped secret links (e.g., /secret/MY_SECRET_KEY).
       {
         path: '/:pathMatch(.*)*',
         name: 'NotFound',
         component: NotFound,
         meta: {
+          title: 'web.TITLES.not_found',
           requiresAuth: false,
         },
       },
@@ -81,31 +134,28 @@ export function createAppRouter(): Router {
   });
 
   /**
-   * router.onError() is intentionally omitted to avoid redundant error handling.
+   * Note: Router guards are set up separately via setupRouterGuards()
+   * after Pinia is installed. This is necessary because guards use
+   * Pinia stores (via usePageTitle, useAuthStore, etc.).
    *
+   * router.onError() is intentionally omitted to avoid redundant error handling.
    * Router errors are already handled by:
    * 1. Route guards via setupRouterGuards()
    * 2. Global error boundary (globalErrorBoundary.ts)
-   * 3. useAsyncHandler composable when used in navigation guards or composables.
-   *
-   * Router errors fall into two main categories:
-   * - Navigation failures: Handled by guards and classifyError()
-   * - Chunk loading failures: Caught by global error handler
-   *
-   * Adding router.onError would:
-   * - Create duplicate error handling paths
-   * - Interfere with our centralized error classification flow
-   * - Add unnecessary complexity to the error architecture
-   *
-   * For new router-related error cases, extend the existing guard or
-   * classification system rather than adding a new error handler here.
-   *
-   * Set up router guards for authentication and locale settings
+   * 3. useAsyncHandler composable when used in navigation guards
    */
-  setupRouterGuards(router);
+
+  // Dev-only: warn when PII rides in a URL query. Registered here (not in
+  // setupRouterGuards) because it needs no Pinia store and is tree-shaken from
+  // production builds. The diagnostics scrubber is the runtime safety-net; this
+  // surfaces the mistake at author time. See src/router/README.md.
+  if (import.meta.env.DEV) {
+    installPiiQueryDevWarning(router);
+  }
 
   return router;
 }
+
 /**
  * About Auto vs Lazy loading
  *
@@ -113,5 +163,4 @@ export function createAppRouter(): Router {
  *    Auto-loaded components are imported and initialized immediately when the
  *    application starts. If these components have dependencies that are not
  *    yet available or initialized, they might not function correctly.
- *
  */

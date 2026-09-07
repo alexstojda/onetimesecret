@@ -1,87 +1,86 @@
-# Vue 3 File Naming Style Guide
+# Frontend Architecture
 
-## Core Rules
+Vue 3 SPA. Routes flow into one of four apps under `src/apps/`; cross-cutting code lives in `src/shared/`.
 
-- Use PascalCase for components, layouts, Stores, views: `UserProfile.vue`
-- Use descriptive suffixes ("discriminator suffixes") to indicate file type/purpose: `auth.routes.ts`
-- Consider kebab-case for non-Vue specific files (e.g. `color-utils.ts`)
+> **Design Principle**: a "Pit of Success". Make it hard to put code in the wrong place.
 
-## Benefits
+## Layout Convention
 
-1. **Clear Purpose**: Suffixes immediately identify file responsibility
-2. **Prevents Conflicts**: Allows related files to share base names without collision
-3. **Better Organization**: Makes codebase more navigable and maintainable
-4. **IDE Support**: Improves autocompletion and file searching
-
-## By Directory
+Each app directory mirrors the top-level `src/` layout:
 
 ```
-api/
-  secrets.ts           // API endpoints/clients
-
-assets/                // Static assets, styles, images
-  style.css
-
-components/
-  HomepageTaglines.vue // UI components
-  DefaultHeader.vue
-
-composables/
-  useMetadata.ts       // Composable hooks
-
-layouts/
-  DefaultLayout.vue    // Page layouts
-
-locales/               // i18n translation files
-  en.json
-
-plugins/               // Plugin configurations
-  errorHandler.ts
-
-router/
-  auth.routes.ts       // Route definitions
-
-schemas/               // Data/validation schemas
-  customer.ts
-
-services/              // Business logic
-  window.ts
-
-stores/                // State management
-  README.md            // Store guidelines & patterns
-  authStore.ts
-
-types/                 // TypeScript definitions
-  forms.ts
-
-utils/                 // Helper functions
-  colorUtils.ts
-
-views/                 // Page components
-  Homepage.vue
+apps/<app>/
+├── views/         # Page-level Vue components
+├── components/    # App-private components
+├── composables/   # App-private composables
+├── layouts/       # App-private layouts
+└── routes.ts      # Route definitions
 ```
 
-## Common Suffixes
-- `.vue` - Components, views, layouts
-- `.routes.ts` - Route definitions and guards
-- `.store.ts` - Pinia stores
-- `.utils.ts` - Helper functions
-- `.fixture.ts` - Test fixtures/data
-- `.spec.ts` - Unit/integration tests
-- `.d.ts` - TypeScript declarations
-- `.json` - Data/configuration files
-- `.md` - Documentation
-- `.css` - Stylesheets
+`apps/colonel/` and `apps/session/` are the reference implementations. `apps/workspace/` and `apps/secret/` still carry residual feature folders (e.g. `secret/conceal`, `workspace/billing`) standing in for parts of `views/`. New code should land in `views/`; existing feature folders fold in when touched.
 
-## Documentation Conventions
-- Include a `README.md` in each major directory
-- READMEs should document:
-  - Directory purpose
-  - Code conventions
-  - Important patterns
-  - Setup requirements
-  - Usage examples
-- Keep READMEs focused on their directory context
-- Maintain READMEs as living documentation
+## The Four Apps
 
-This standardized naming helps us understand file purposes and reduces ambiguity.
+| App         | Purpose                                                | Auth     |
+|-------------|--------------------------------------------------------|----------|
+| `secret`    | Create and reveal secrets (the transactional core)     | Mixed    |
+| `workspace` | Dashboard, account, billing, organizations, domains    | Required |
+| `session`   | Sign-in, sign-up, MFA, password reset                  | Public   |
+| `colonel`   | System administration                                  | Colonel  |
+
+Route composition and load order live in `src/router/index.ts`; first match wins.
+
+## Shared Resources
+
+`src/shared/` holds cross-app primitives (`components/`, `composables/`, `layouts/`, `stores/`). Promote code here only when more than one app needs it. Anything used by exactly one app stays inside that app.
+
+## Conceptual Dimensions
+
+Several independent dimensions control how a view renders. Conflating them was the source of past architectural confusion.
+
+| Dimension        | Binds at        | Question                       | Role                          |
+|------------------|-----------------|--------------------------------|-------------------------------|
+| Interaction Mode | Design-time     | What is the user doing?        | Router selects the app        |
+| Domain Context   | Runtime         | How should it look?            | Wrapper adapts presentation   |
+| Domain Scope     | Session         | Which domain am I managing?    | Filter scopes Workspace       |
+| Homepage Mode    | Deployment-time | Is creation permitted?         | Gatekeeper for `/`            |
+
+**Domain Context** is detected per-request from the request host: `Canonical` (config-defined) or `Custom` (per-domain branding). Each custom domain belongs to one organization and carries its own brand config.
+
+**Domain Scope** (Workspace only) elevates Domain Context into a persistent management scope. Privacy defaults and new-secret creation flow through the selected domain for the duration of the session.
+
+**Homepage Mode** gates `/`:
+
+| Mode     | Who can create       | Who can view | Homepage shows        |
+|----------|----------------------|--------------|-----------------------|
+| Open     | Anyone               | Anyone       | Form + explainer      |
+| Internal | Internal IPs/headers | Anyone       | Form + explainer      |
+| External | Nobody               | Anyone       | "Nothing to see here" |
+
+## Actor Roles
+
+Three role systems apply at different layers. Do not conflate them.
+
+- **Transaction roles** (resolved by `useSecretContext`): `CREATOR`, `RECIPIENT_AUTH`, `RECIPIENT_ANON`. Answers "who are you relative to *this secret*?". `CREATOR` is singular by design; recipient variance is intentional.
+- **Organization roles**: `OWNER`, `ADMIN`, `MEMBER`. Standard RBAC inside Workspace.
+- **Account roles** (`CustomerRole`): `CUSTOMER`, `COLONEL`, `ADMIN`, `STAFF`, `RECIPIENT`, `USER_DELETED_SELF`, `ANONYMOUS`. Global account type; `COLONEL` grants `/colonel/*` access. Mirrors the backend's assignable roles (`SetRole::VALID_ROLES`) plus lifecycle values; an unknown role on the wire degrades to `CUSTOMER` rather than failing the record parse.
+
+| Concern        | Secret App                  | Workspace App      |
+|----------------|-----------------------------|--------------------|
+| Auth variance  | High (anon, auth, owner)    | Low (always auth)  |
+| Logic model    | Dimensional matrix          | Standard RBAC      |
+
+## Naming Conventions
+
+PascalCase for Vue components, layouts, stores, views (`UserProfile.vue`). kebab-case for non-Vue utilities (`color-utils.ts`). Suffixes signal purpose: `.routes.ts`, `Store.ts`, `.spec.ts`, `.fixture.ts`, `.d.ts`.
+
+## Notes
+
+- `/receipt/:receiptIdentifier` lives in the Secret app, not Workspace. It requires "ownership" but ownership here is historically the unguessable URL, not authentication; the interaction is still transactional.
+- Workspace imports brand *data* (to populate forms) but not brand *presentation logic* (Workspace is always OTS-branded). Presentation lives under the Secret app.
+
+## See Also
+
+- [`src/router/index.ts`](./router/index.ts), route composition and ordering
+- [`../docs/product/secret-lifecycle.md`](../docs/product/secret-lifecycle.md), secret state FSM
+- `package.json`, dev/build/test/lint commands

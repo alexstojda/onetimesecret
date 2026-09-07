@@ -89,11 +89,11 @@ Key Points:
 - App.vue merges window properties with route props
 - Layouts receive combined props object
 - Child components receive subset of props
-- WindowService accessed at App.vue and some components
+- bootstrapStore accessed via Pinia
 
 ```
 Router Config                        Window Properties
-(meta.layoutProps)                   (WindowService)
+(meta.layoutProps)                   (bootstrapStore)
        │                                   │
        │                                   │
        ▼                                   ▼
@@ -128,3 +128,95 @@ Layout Selection:
 route.meta.layout determines which layout wraps page
 route.meta.layoutProps overrides default layout props
 ```
+
+## Route File Organization
+
+Routes are organized by app domain under `src/apps/`, with cross-cutting routes in `src/router/`:
+
+```
+src/
+├── apps/
+│   ├── colonel/
+│   │   └── routes.ts              # Admin routes
+│   ├── secret/
+│   │   └── routes/
+│   │       ├── incoming.ts        # Secret creation (API-driven)
+│   │       ├── receipt.ts        # Metadata views
+│   │       └── secret.ts          # Secret reveal
+│   ├── session/
+│   │   └── routes.ts              # Auth routes (login, signup, etc.)
+│   └── workspace/
+│       └── routes/
+│           ├── account.ts         # Account settings
+│           ├── billing.ts         # Billing/subscription
+│           ├── dashboard.ts       # Dashboard views
+│           └── teams.ts           # Team management
+└── router/
+    ├── index.ts                   # Main router (assembles all routes)
+    ├── guards.routes.ts           # Navigation guards
+    ├── layout.config.ts           # Layout component config
+    ├── piiQueryGuard.ts           # Dev-only "no PII in query" warning
+    ├── public.routes.ts           # Public pages (home, feedback, etc.)
+    └── queryParams.handler.ts     # Query param handling
+```
+
+The main router (`src/router/index.ts`) imports and assembles routes from all apps.
+
+## Query-string policy: no PII in the URL
+
+**Never put personally-identifiable data (email, tokens, passwords, one-time
+codes) in a URL query string.** A URL is not a private channel — it leaks out of
+the application through:
+
+- browser history and bfcache (persists on the device, may sync across browsers),
+- the `Referer` header on any outbound request or external link,
+- proxy / CDN / web-server access logs, and
+- Sentry breadcrumbs and `event.request.url`.
+
+This is finding **F6** of the disclosure matrix
+(`docs/specs/recipient-disclosure/recipient-disclosure-matrix.html`): *"The URL is the bearer secret
+— and it leaks."*
+
+**Instead, hand PII to the next page via router history `state`:**
+
+```ts
+// ✗ Don't — email is PII and now lives in the URL, history, logs, Sentry.
+router.push({ path: '/check-email', query: { email } });
+
+// ✓ Do — state travels with the navigation but never enters the URL.
+router.push({ path: '/check-email', state: { checkEmailAddress: email } });
+```
+
+Read it back from `window.history.state` — the browser-standard, stable surface
+that vue-router persists the navigation state into. There is no typed
+`route.state` (history state is not part of `RouteLocationNormalized`), and
+`router.options.history.state`, while it works, reaches into the `@alpha`
+`RouterHistory` interface, so prefer the plain History API:
+
+```ts
+const state = window.history.state as Record<string, unknown> | null;
+const email = sanitizeDisplayEmail(state?.checkEmailAddress);
+```
+
+A plain reload **preserves** history `state` — the browser keeps
+`window.history.state` on the current entry and vue-router restores it, so the
+email persists across a refresh (harmlessly: state never enters the URL). State
+is absent only on a genuinely fresh entry — a shared link, a new tab, or an
+address-bar navigation — so design the page to degrade gracefully there (e.g.
+`/check-email` falls back to generic copy). Non-PII context (billing
+`product`/`interval`, a `redirect` path) is fine in the query — it *should*
+survive refresh and sharing.
+
+This policy is enforced in depth:
+
+| Layer | Mechanism | File |
+| ----- | --------- | ---- |
+| Author time | `ots/no-pii-in-query` ESLint rule flags `query: { email }` literals | `src/build/eslint/no-pii-in-query.ts` |
+| Dev runtime | Navigation guard warns when a PII key rides in `to.query` | `src/router/piiQueryGuard.ts` |
+| Prod runtime | Diagnostics scrubber redacts query emails from Sentry on every route | `src/plugins/core/enableDiagnostics.ts` |
+
+The shared key list and the display sanitizer live in `src/utils/pii.ts`.
+
+Existing `?email=` prefill on `/signin` and `/signup` is grandfathered (it
+predates this policy and is scrubbed at the diagnostics layer); do not extend the
+pattern to new routes.

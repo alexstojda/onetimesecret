@@ -1,0 +1,109 @@
+# apps/api/domains/logic/domains/remove_domain.rb
+#
+# frozen_string_literal: true
+
+require 'onetime/domain_validation/strategy'
+require 'onetime/operations/delete_sender_domain'
+require_relative '../base'
+
+module DomainsAPI::Logic
+  module Domains
+    class RemoveDomain < DomainsAPI::Logic::Base
+      attr_reader :greenlighted, :extid, :display_domain
+
+      def process_params
+        @extid = sanitize_identifier(params['extid'])
+      end
+
+      def raise_concerns
+        raise_form_error 'Please provide a domain ID' if @extid.empty?
+
+        # Get customer's organization for domain ownership
+        # Organization available via @organization
+        require_organization!
+
+        @custom_domain = Onetime::CustomDomain.find_by_extid(@extid)
+        raise_form_error 'Domain not found' unless @custom_domain
+
+        # Verify the customer can access this domain through org membership
+        unless @custom_domain.accessible_by?(@cust)
+          raise_form_error 'Domain not found'
+        end
+
+        # Domain deletion requires admin+ (custom_domains entitlement),
+        # consistent with AddDomain (#3033) and GetDomain.
+        # Damaged ownership metadata answers 'Domain not found', exactly like
+        # the membership refusal above, and the nil never reaches
+        # require_entitlement_in!.
+        domain_org = load_organization_for_domain(@custom_domain) do
+          raise_form_error 'Domain not found'
+        end
+        require_entitlement_in!(domain_org, 'custom_domains')
+
+        # Domain-scope enforcement: deny cross-domain deletion (#3384).
+        # nil membership is colonel-only here: require_entitlement_in! above
+        # already rejected any non-colonel without an active membership row.
+        membership = Onetime::OrganizationMembership.find_by_org_customer(
+          domain_org.objid, @cust.objid
+        )
+        if membership && !membership.can_access_domain?(@custom_domain)
+          raise_not_found 'Domain not found'
+        end
+      end
+
+      def process
+        OT.ld "[RemoveDomain] Processing #{@extid} (#{@custom_domain.display_domain})"
+        @greenlighted   = true
+        @display_domain = @custom_domain.display_domain
+
+        # Delete from external SSL provider via strategy
+        delete_vhost
+
+        # Delete from external mail provider before destroy! wipes mailer_config
+        delete_sender_domain
+
+        # Destroy method operates inside a multi block that deletes the domain
+        # record, removes it from customer's domain list, and global list so
+        # it's all or nothing. It does not delete the external approximated
+        # vhost record.
+        @custom_domain.destroy!
+
+        # Clear the session's domain context if it matches the removed domain.
+        # Route is sessionauth-only, so sess is always a real Rack session.
+        if sess && sess['domain_context'] == @display_domain
+          sess['domain_context'] = nil
+        end
+
+        success_data
+      end
+
+      # Deletes vhost from external provider using the configured strategy.
+      # For Approximated strategy, this calls the API. For other strategies,
+      # this is a no-op.
+      #
+      def delete_vhost
+        strategy = Onetime::DomainValidation::Strategy.for_config(OT.conf)
+        result   = strategy.delete_vhost(@custom_domain)
+
+        OT.info "[RemoveDomain.delete_vhost] #{@display_domain} -> #{result[:message]}"
+      rescue HTTParty::ResponseError, Timeout::Error, Errno::ECONNREFUSED => ex
+        OT.le "[RemoveDomain.delete_vhost error] #{@cust.extid} #{@display_domain} #{ex}"
+        # Continue with domain removal even if vhost deletion fails
+      end
+
+      def delete_sender_domain
+        Onetime::Operations::DeleteSenderDomain.new(
+          mailer_config: @custom_domain.mailer_config,
+        ).call
+      end
+
+      def success_data
+        {
+          user_id: @cust.objid,
+          record: {},
+          message: "Removed #{display_domain}",
+        }
+      end
+    end
+  end
+end

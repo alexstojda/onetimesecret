@@ -1,0 +1,16 @@
+<%= t('email.feedback_email.title') %>
+=============
+
+<%= t('email.feedback_email.from_label') %> <%= email_address %>
+<%= t('email.feedback_email.user_id_label') %> <%= user_id %>
+<%= t('email.feedback_email.domain_label') %> <%= display_domain %> (<%= domain_strategy %>)
+<%= t('email.feedback_email.timezone_label') %> <%= tz %>
+<%= t('email.feedback_email.version_label') %> <%= version %>
+
+<%= t('email.feedback_email.message_label') %>
+--------
+<%= message %>
+
+--
+<%= signature_name || t('email.feedback_email.signature') %>
+<%= baseuri %>

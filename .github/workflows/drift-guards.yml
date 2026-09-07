@@ -1,0 +1,46 @@
+# .github/workflows/drift-guards.yml
+#
+# Cheap (grep/sed-only, seconds) drift guards that must run on every PR
+# (install-onboarding C9). They also run inside validate-config.yml, but that
+# workflow is workflow_dispatch-only — these two checks are the ratchets that
+# keep manifests honest, so they get an always-on lane:
+#
+#   check-version-pins.sh    Docker image tags + devcontainer toolchain match
+#                            .ruby-version/.node-version (VER series, C8 note)
+#   check-env-reference.sh   every consumed env var is documented in
+#                            .env.reference or explicitly ignored (QS-11)
+#   check-ci-secrets.sh      every secrets.X a workflow reads is documented
+#                            in that workflow's header comment, or explicitly
+#                            ignored (CI secrets are a separate surface from
+#                            .env.reference — see scripts/check-ci-secrets.sh)
+#
+# No path filter: check-env-reference.sh scans ENV reads across lib/, apps/,
+# etc/ — nearly any code change can introduce a new variable, and the whole
+# job costs seconds.
+---
+name: Drift guards
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift-guards:
+    name: version pins + env reference
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Assert Docker/devcontainer tags match version pin files
+        run: bash scripts/check-version-pins.sh
+
+      - name: Assert .env.reference documents every consumed env var
+        run: bash scripts/check-env-reference.sh
+
+      - name: Assert workflow headers document every consumed CI secret
+        run: bash scripts/check-ci-secrets.sh

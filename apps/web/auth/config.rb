@@ -1,0 +1,232 @@
+# apps/web/auth/config.rb
+#
+# frozen_string_literal: true
+
+#
+# IMPORTANT: Test files should NOT require this file or anything below it.
+#
+# This file triggers the full boot chain (database.rb → Onetime.auth_config)
+# which requires production config files and database connections.
+#
+# For specs that need constants from config/features/*.rb, use:
+#   require_relative 'spec/support/auth_test_constants'
+#   include AuthTestConstants
+#
+# This provides test-safe copies of MFA limits, status IDs, etc.
+
+require 'rodauth'
+require 'rodauth/tools'
+
+module Auth
+  class Config < Rodauth::Auth
+    # Track configuration state to prevent duplicate configuration.
+    # In test environments, this file may be required multiple times
+    # (via specs and Application Registry discovery). Rodauth's configure
+    # block runs each time it's called, so we guard against re-entry.
+    @configured = false
+
+    class << self
+      attr_accessor :configured
+    end
+
+    require_relative 'lib/logging'
+    require_relative 'database'
+    require_relative 'operations'
+    require_relative 'config/base'
+    require_relative 'config/email'
+    require_relative 'config/features'
+    require_relative 'config/hooks'
+    require_relative 'config/json_mode'
+    require_relative 'config/overrides'
+    require_relative 'config/rodauth_overrides'
+
+    configure do
+      # =====================================================================
+      # CONFIGURATION GUARD
+      # =====================================================================
+      #
+      # Skip if already configured. This prevents errors when the configure
+      # block is called multiple times (e.g., in test environments).
+      # Use `next` not `return` because we're in an instance_exec context.
+      #
+      if Auth::Config.configured
+        OT.lw '[Auth::Config] Skipping duplicate configuration (already configured)'
+        next
+      end
+
+      # =====================================================================
+      # CONFIGURATION MODULES
+      # =====================================================================
+      #
+      # Each module handles its own `enable` calls alongside configuration.
+      # This keeps feature enablement co-located with feature configuration.
+      #
+
+      # Core features: base, json, login, logout, table_guard, etc.
+      Base.configure(self)
+
+      # Password hashing: argon2id
+      Features::Argon2.configure(self)
+
+      # Audit logging for authentication events (feature enablement, defaults,
+      # and the per-event audit_log_message_for/metadata_for registrations)
+      Features::AuditLogging.configure(self)
+
+      # Account lifecycle: create, verify, close, change/reset password
+      # (must come before Email.configure - provides email_base feature)
+      Features::AccountManagement.configure(self)
+
+      # Email delivery configuration (requires email_base from above)
+      Email.configure(self)
+
+      # Hooks for customizing authentication behavior.
+      # NOTE: hooks don't chain — this order is a precedence list (last writer
+      # wins per hook name); each hook has exactly one owner. See config/hooks.rb.
+      # restrict_to enforcement
+      # (ADR-034#restrict-to-is-an-access-control-not-a-display-preference
+      # / #reject-as-not-found-not-forbidden, #4139). Registered FIRST among
+      # the hooks because before_rodauth fires for every route: a method the
+      # request host restricts away must 404 before any other hook observes the
+      # request. Registration order is otherwise irrelevant (hooks are
+      # last-writer-wins per NAME, and this is the sole owner of
+      # before_rodauth), but reading order should match execution order.
+      Hooks::RestrictTo.configure(self)
+
+      Hooks::Account.configure(self)
+      Hooks::Login.configure(self)
+      Hooks::Logout.configure(self)
+      Hooks::Password.configure(self)
+      # Rate limiting for POST /auth/reset-password-request (issue #3872):
+      # bounds the timing-residual sampling the enumeration override (#3857)
+      # accepts. Requires :reset_password (enabled by AccountManagement above)
+      # so the before_reset_password_request_route hook exists.
+      Hooks::ResetPasswordRequest.configure(self)
+      # Rate limiting for POST /auth/create-account (issue #3948, audit
+      # 2026-07-30 finding #4): bounds unauthenticated, unthrottled account
+      # creation — one Customer record (no TTL) plus one welcome email per
+      # distinct address. Simple mode enforces the SAME limiter from
+      # AccountAPI::Logic::Account::CreateAccount#raise_concerns; this is the
+      # full-mode half, and full mode is what production runs. Requires
+      # :create_account (enabled by AccountManagement above) so the
+      # before_create_account_route hook exists.
+      Hooks::CreateAccount.configure(self)
+
+      # Method overrides (replace Rodauth methods, not before/after hooks)
+      # Absolute URLs (every *_email_link, the WebAuthn origin) follow the
+      # request's public host rather than the proxy-rewritten authority
+      # (#4221). Also defines public_display_domain, which the email template
+      # blocks above read at request time.
+      Overrides::PublicBaseUrl.configure(self)
+      Overrides::PasswordMigration.configure(self)
+      Overrides::ErrorHandling.configure(self)
+      # Enumeration safety for the reset-password-request path (issue #3857).
+      # Runs after AccountManagement enables :reset_password above, so the
+      # overridden methods exist.
+      Overrides::ResetPasswordEnumeration.configure(self)
+      # Enumeration safety for login / create-account / unlock-account-request
+      # (audit 2026-08-02 M-1, M-2, L-6). Uses a PREPENDED module so it
+      # composes with ResetPasswordEnumeration's class-level
+      # account_from_login rather than clobbering it; all overrides are
+      # route-scoped no-ops elsewhere, so ordering relative to the
+      # conditionally-enabled features below (lockout) is immaterial.
+      Overrides::AccountEnumeration.configure(self)
+      RodauthOverrides.configure(self)
+
+      # Lockout: brute force protection
+      if Onetime.auth_config.lockout_enabled?
+        Features::Lockout.configure(self)
+      end
+
+      # Password requirements: strength validation
+      if Onetime.auth_config.password_requirements_enabled?
+        Features::PasswordRequirements.configure(self)
+      end
+
+      # Active sessions: track and manage sessions across devices
+      if Onetime.auth_config.active_sessions_enabled?
+        Features::ActiveSessions.configure(self)
+      end
+
+      # Remember me: persistent login across browser sessions
+      if Onetime.auth_config.remember_me_enabled?
+        Features::RememberMe.configure(self)
+      end
+
+      # Multi-Factor Authentication: TOTP, recovery codes
+      if Onetime.auth_config.mfa_enabled?
+        Features::MFA.configure(self)
+        Hooks::MFA.configure(self)
+      end
+
+      # Email auth: passwordless login via email links (aka magic links)
+      if Onetime.auth_config.email_auth_enabled?
+        Features::EmailAuth.configure(self)
+        Hooks::EmailAuth.configure(self)
+        # Rate limiting for POST /auth/email-login-request (audit 2026-08-02
+        # L-5): bounds unauthenticated magic-link mail dispatch per client IP.
+        # Additive to Rodauth's per-account email_auth_skip_resend_email_within
+        # throttle. Runs inside this branch so the
+        # before_email_auth_request_route hook exists (requires :email_auth,
+        # enabled by Features::EmailAuth above).
+        Hooks::EmailAuthRequest.configure(self)
+        # before_email_auth_request only exists once :email_auth is enabled;
+        # closes the multi-phase-login magic-link path on the /login route.
+        Hooks::RestrictTo.configure_email_auth(self)
+      end
+
+      # WebAuthn: biometrics, security keys (Face ID, Touch ID, YubiKey)
+      if Onetime.auth_config.webauthn_enabled?
+        Features::WebAuthn.configure(self)
+        Hooks::WebAuthn.configure(self)
+      end
+
+      # Two-factor completion: after_two_factor_authentication is provided by
+      # two_factor_base, which BOTH the otp and webauthn features enable
+      # transitively. The app-side completion (SyncSession, awaiting_mfa
+      # clear, deferred SSO bind, sign-in alert) must fire for EITHER factor,
+      # so this registers whenever any two-factor feature is loaded —
+      # including webauthn-only deployments (AUTH_MFA_ENABLED=false), which
+      # would otherwise complete Rodauth's webauthn-auth but never sync the
+      # app session. Must come AFTER the MFA/WebAuthn feature blocks above so
+      # two_factor_base (and therefore the hook method) exists.
+      if Onetime.auth_config.mfa_enabled? || Onetime.auth_config.webauthn_enabled?
+        Hooks::TwoFactor.configure(self)
+      end
+
+      # OmniAuth: external identity providers (SSO via OIDC)
+      # Routes are registered when either:
+      # - AUTH_SSO_ENABLED=true (platform-level SSO with env var credentials)
+      # - ORGS_SSO_ENABLED=true (domain-level SSO with DB credentials)
+      # When only orgs_sso_enabled?, platform providers may be empty but routes
+      # must exist for OmniAuthTenant hook to inject tenant credentials at runtime.
+      if Onetime.auth_config.omniauth_enabled? || Onetime.auth_config.orgs_sso_enabled?
+        Features::OmniAuth.configure(self)
+        Hooks::OmniAuth.configure(self)
+        Hooks::OmniAuthTenant.configure(self)
+      end
+
+      # OAuth2/OIDC Identity Provider: this OTS instance acts as an IdP.
+      # Hooks (key loading, scope/claim mapping) and seeded clients land in
+      # tasks 5 and 6 of issue #3104. Configuring the feature now is safe:
+      # without keys, the runtime endpoints raise, but boot is unaffected.
+      if Onetime.auth_config.oauth_enabled?
+        Features::OAuth.configure(self)
+        Hooks::OAuth.configure(self)
+      end
+
+      # Billing: plan selection carry-through for checkout flow
+      if Onetime.billing_config.enabled?
+        Hooks::Billing.configure(self)
+      end
+
+      # Single owner of only_json?. Must run AFTER all hooks so the
+      # consolidated exemption logic can consult Hooks::OAuth::OAUTH_EXEMPT_PATHS
+      # and omniauth_prefix. See apps/web/auth/config/json_mode.rb for the
+      # rationale (def_auth_value_method replaces previous definitions).
+      ::Auth::JsonMode.configure(self)
+
+      # Mark configuration complete
+      Auth::Config.configured = true
+    end
+  end
+end

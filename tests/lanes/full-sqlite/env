@@ -1,0 +1,16 @@
+# Lane: full-sqlite — full auth mode against in-memory SQLite.
+# CI job: ruby-integration-full (T3, "SQLite" matrix rows; billing via overlay)
+#
+# NOTE: lib/tasks/spec.rake hardcodes AUTH_DATABASE_URL/ORGS_SSO_ENABLED
+# for this task as a defense against ambient env. Keeping identical values
+# here is intentional: the lane is correct standalone (e.g. running rspec
+# by hand from this directory), and rake's override is a no-op.
+AUTHENTICATION_MODE=full
+AUTH_DATABASE_URL='sqlite::memory:'
+ORGS_SSO_ENABLED=true
+
+# Generated prerequisites, produced by tests/lanes/run before the tasks
+# below (see the codegen phase there). spec/spec_helper.rb refuses to boot
+# with an empty generated/locales, so every lane that runs Ruby specs
+# declares it.
+LANES_CODEGEN='locales'

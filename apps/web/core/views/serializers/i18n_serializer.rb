@@ -1,27 +1,28 @@
 # apps/web/core/views/serializers/i18n_serializer.rb
+#
+# frozen_string_literal: true
 
 module Core
   module Views
-
     # Serializes internationalization data for the frontend
     #
     # Responsible for providing locale configuration, available locales,
     # and other i18n-related settings to the frontend.
     module I18nSerializer
-
       # Serializes internationalization data from view variables
       #
       # @param view_vars [Hash] The view variables containing locale information
-      # @param i18n [Object] The internationalization instance
       # @return [Hash] Serialized i18n configuration including locale settings
-      def self.serialize(view_vars, i18n)
-        output = self.output_template
+      def self.serialize(view_vars)
+        output = output_template
 
-        output[:locale] = view_vars[:locale]
-        output[:default_locale] = OT.default_locale # the application default
-        output[:fallback_locale] = OT.fallback_locale
-        output[:supported_locales] = OT.supported_locales
-        output[:i18n_enabled] = OT.i18n_enabled
+        output['locale']            = view_vars['locale']
+        output['default_locale']    = OT.default_locale # the application default
+        output['fallback_locale']   = OT.fallback_locale
+        output['supported_locales'] = OT.supported_locales
+        output['i18n_enabled']      = OT.i18n_enabled
+        output['date_format']       = OT.date_format
+        output['datetime_format']   = OT.datetime_format
 
         output
       end
@@ -32,11 +33,13 @@ module Core
         # @return [Hash] Template with all possible i18n output fields
         def output_template
           {
-            locale: nil,
-            default_locale: nil,
-            fallback_locale: nil,
-            supported_locales: [],
-            i18n_enabled: nil,
+            'locale' => nil,
+            'default_locale' => nil,
+            'fallback_locale' => nil,
+            'supported_locales' => [],
+            'i18n_enabled' => nil,
+            'date_format' => 'locale',
+            'datetime_format' => 'locale',
           }
         end
       end

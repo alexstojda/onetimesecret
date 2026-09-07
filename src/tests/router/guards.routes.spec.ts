@@ -1,0 +1,1216 @@
+// src/tests/router/guards.routes.spec.ts
+
+import { createTestingPinia } from '@pinia/testing';
+import { setActivePinia } from 'pinia';
+import { afterEach, beforeEach, describe, expect, it, test, vi } from 'vitest';
+import {
+  NavigationGuardReturn,
+  RouteLocationNormalized,
+  RouteLocationRaw,
+  Router,
+} from 'vue-router';
+
+import {
+  AuthValidator,
+  handleColonelRequirement,
+  handleOrgRoleRequirement,
+  handleSsoOnlyRoute,
+  setupRouterGuards,
+  validateAuthentication,
+} from '@/router/guards.routes';
+import { loggingService } from '@/services/logging.service';
+import { useAuthStore } from '@/shared/stores';
+import { useBootstrapStore } from '@/shared/stores/bootstrapStore';
+import { useOrganizationStore } from '@/shared/stores/organizationStore';
+import { isSsoOnlyMode } from '@/utils/features';
+
+/** Sync guard that blocks routes for disabled auth features. */
+type FeatureGuard = (to: RouteLocationNormalized) => RouteLocationRaw | true;
+
+/** Async guard that handles auth redirects and validation. */
+type AuthGuard = (
+  to: RouteLocationNormalized
+) => Promise<NavigationGuardReturn>;
+
+const protectedRoute: RouteLocationNormalized = {
+  meta: { requiresAuth: true },
+  fullPath: '/protected',
+  path: '/protected',
+  name: 'Protected',
+  params: {},
+  query: {},
+  hash: '',
+  matched: [],
+  redirectedFrom: undefined,
+};
+
+const publicRoute: RouteLocationNormalized = {
+  ...protectedRoute,
+  meta: { requiresAuth: false },
+};
+
+vi.mock('@/shared/stores/authStore', () => ({
+  useAuthStore: vi.fn(() => ({
+    isAuthenticated: false,
+    isFullyAuthenticated: false,
+    needsCheck: false,
+    checkWindowStatus: vi.fn(),
+  })),
+}));
+
+vi.mock('@/shared/stores/languageStore', () => ({
+  useLanguageStore: vi.fn(() => ({
+    setCurrentLocale: vi.fn(),
+  })),
+}));
+
+vi.mock('@/shared/composables/usePageTitle', () => ({
+  usePageTitle: vi.fn(() => ({
+    setTitle: vi.fn(),
+    useComputedTitle: vi.fn(),
+    formatTitle: vi.fn(),
+  })),
+}));
+
+vi.mock('@/utils/features', () => ({
+  isSsoOnlyMode: vi.fn(() => false),
+}));
+
+vi.mock('@/shared/stores/organizationStore', () => ({
+  useOrganizationStore: vi.fn(),
+}));
+
+describe('Router Guards', () => {
+  let router: Router;
+  let pinia: ReturnType<typeof createTestingPinia>;
+
+
+  beforeEach(() => {
+    pinia = createTestingPinia({
+      createSpy: vi.fn,
+      stubActions: false,
+      initialState: {
+        bootstrap: {
+          authenticated: false,
+          domain_strategy: 'canonical',
+          site_host: 'onetimesecret.com',
+          display_domain: 'onetimesecret.com',
+          domains_enabled: false,
+          cust: null,
+        },
+      },
+    });
+    setActivePinia(pinia);
+    useBootstrapStore();
+
+    router = {
+      beforeEach: vi.fn(),
+      afterEach: vi.fn(),
+    } as unknown as Router;
+
+    vi.clearAllMocks();
+  });
+
+  it('should setup router guards', () => {
+    setupRouterGuards(router);
+    expect(router.beforeEach).toHaveBeenCalled();
+  });
+
+  describe('custom domain layout guard (guard index 0)', () => {
+    /**
+     * The first beforeEach guard applies custom domain layout defaults
+     * for guest/public routes. It skips:
+     * - Non-custom domains (domain_strategy !== 'custom')
+     * - Routes with requiresAuth (authenticated workspace pages)
+     * - Routes with isAuthRoute (signin/signup handle their own branding)
+     */
+
+    type LayoutGuard = (to: RouteLocationNormalized) => true | undefined;
+
+    const getLayoutGuard = (): LayoutGuard => {
+      setupRouterGuards(router);
+      return vi.mocked(router.beforeEach).mock.calls[0][0] as LayoutGuard;
+    };
+
+    it('returns early for non-custom domains', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ domain_strategy: 'canonical' });
+
+      const guard = getLayoutGuard();
+      const to = {
+        meta: {},
+        path: '/secret/abc123',
+        name: 'SecretReveal',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/secret/abc123',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+
+      const result = guard(to);
+      expect(result).toBe(true);
+      // meta.layoutProps should NOT be set
+      expect(to.meta.layoutProps).toBeUndefined();
+    });
+
+    it('returns early for requiresAuth routes on custom domain', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ domain_strategy: 'custom' });
+
+      const guard = getLayoutGuard();
+      const to = {
+        meta: { requiresAuth: true },
+        path: '/dashboard',
+        name: 'Dashboard',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/dashboard',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+
+      const result = guard(to);
+      expect(result).toBe(true);
+      expect(to.meta.layoutProps).toBeUndefined();
+    });
+
+    it('returns early for isAuthRoute routes on custom domain (signin/signup handle own branding)', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ domain_strategy: 'custom' });
+
+      const guard = getLayoutGuard();
+      const to = {
+        meta: { isAuthRoute: true },
+        path: '/signin',
+        name: 'Sign In',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/signin',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+
+      const result = guard(to);
+      expect(result).toBe(true);
+      // Auth routes handle their own layout — guard should NOT override layoutProps
+      expect(to.meta.layoutProps).toBeUndefined();
+    });
+
+    it('overrides layoutProps for public routes on custom domain', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ domain_strategy: 'custom', domain_logo: 'https://example.com/logo.png' });
+
+      const guard = getLayoutGuard();
+      const to = {
+        meta: {},
+        path: '/secret/abc123',
+        name: 'SecretReveal',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/secret/abc123',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+
+      guard(to);
+      const layoutProps = to.meta.layoutProps as Record<string, unknown>;
+      expect(layoutProps).toBeDefined();
+      // Masthead is always off on custom domains, even with a logo configured:
+      // the page body owns the logo. Gating it on logo presence duplicated the
+      // /incoming header and leaked the masthead onto the reveal page.
+      expect(layoutProps.displayMasthead).toBe(false);
+      expect(layoutProps.displayNavigation).toBe(false);
+      expect(layoutProps.displayFooterLinks).toBe(false);
+      expect(layoutProps.displayFeedback).toBe(false);
+    });
+
+    it('keeps displayMasthead false when custom domain has no logo', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ domain_strategy: 'custom', domain_logo: null });
+
+      const guard = getLayoutGuard();
+      const to = {
+        meta: {},
+        path: '/secret/abc123',
+        name: 'SecretReveal',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/secret/abc123',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+
+      guard(to);
+      const layoutProps = to.meta.layoutProps as Record<string, unknown>;
+      expect(layoutProps.displayMasthead).toBe(false);
+    });
+  });
+
+  it('should redirect authenticated users from auth routes', async () => {
+    setupRouterGuards(router);
+
+    // Index 3: main guard (0=custom-domain, 1=feature-check, 2=sso-only, 3=main)
+    const guard = vi.mocked(router.beforeEach).mock.calls[3][0] as AuthGuard;
+    const to: RouteLocationNormalized = {
+      meta: { isAuthRoute: true },
+      query: {},
+      path: '/auth',
+      name: 'Auth',
+      params: {},
+      hash: '',
+      fullPath: '/auth',
+      matched: [],
+      redirectedFrom: undefined
+    };
+
+    const authStore = { isAuthenticated: true, isFullyAuthenticated: true };
+    vi.mocked(useAuthStore).mockReturnValue(authStore as ReturnType<typeof useAuthStore>);
+
+    const result = await guard(to);
+
+    expect(result).toEqual({ name: 'Dashboard' });
+  });
+
+  describe('auth-route redirect param validation (L-5, via main guard)', () => {
+    // handleAuthRouteRedirect validates the ?redirect param with the shared
+    // isValidInternalPath (rejects protocol-relative, embedded '://',
+    // backslashes, control characters, encoded traversal and over-length
+    // paths), falling back to Dashboard. Exercised through the main guard
+    // (index 3) for an authenticated user hitting an auth route.
+    //
+    // A valid param resolves to the RAW STRING, not { path }: vue-router runs
+    // a `path` through parseURL as a path only, which silently strips ?query
+    // and #hash. See the string/object cases below.
+
+    const authRouteWithRedirect = (redirect: string): RouteLocationNormalized => ({
+      meta: { isAuthRoute: true },
+      query: { redirect },
+      path: '/signin',
+      name: 'Sign In',
+      params: {},
+      hash: '',
+      fullPath: '/signin',
+      matched: [],
+      redirectedFrom: undefined,
+    });
+
+    const getMainGuard = (): AuthGuard => {
+      setupRouterGuards(router);
+      const authStore = { isAuthenticated: true, isFullyAuthenticated: true };
+      vi.mocked(useAuthStore).mockReturnValue(authStore as ReturnType<typeof useAuthStore>);
+      // Index 3: main guard (0=custom-domain, 1=feature-check, 2=sso-only, 3=main)
+      return vi.mocked(router.beforeEach).mock.calls[3][0] as AuthGuard;
+    };
+
+    it('honours a valid internal redirect param', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('/dashboard/settings'));
+      expect(result).toBe('/dashboard/settings');
+    });
+
+    it('rejects repeated redirect params and falls back to Dashboard', async () => {
+      const to = authRouteWithRedirect(
+        ['/dashboard/settings', '/account'] as unknown as string
+      );
+
+      expect(await getMainGuard()(to)).toEqual({ name: 'Dashboard' });
+    });
+
+    it('preserves the query string and hash through the guard', async () => {
+      // The regression: returning { path: redirectParam } handed vue-router a
+      // value it parses as a path ONLY, so '?view=raw' and '#content' were
+      // dropped and the user landed on a bare /secret/abc.
+      const target = '/secret/abc?view=raw#content';
+      const result = await getMainGuard()(authRouteWithRedirect(target));
+
+      expect(result).toBe(target);
+      // Explicitly NOT the object form, which is what loses them.
+      expect(result).not.toEqual({ path: target });
+    });
+
+    it('preserves multiple query params and their ordering', async () => {
+      const target = '/search?q=a%20b&sort=desc&page=2#results';
+      expect(await getMainGuard()(authRouteWithRedirect(target))).toBe(target);
+    });
+
+    it('rejects a protocol-relative redirect (//evil) and falls back to Dashboard', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('//evil'));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+
+    it('rejects an embedded-protocol redirect (/a://b) and falls back to Dashboard', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('/a://b'));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+
+    it('rejects an over-length redirect (>2048 chars) and falls back to Dashboard', async () => {
+      const overLength = '/' + 'a'.repeat(2048);
+      const result = await getMainGuard()(authRouteWithRedirect(overLength));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+
+    it('rejects a backslash-disguised authority and falls back to Dashboard', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('/\\evil.example'));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+
+    it('rejects an encoded traversal and falls back to Dashboard', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('/%2e%2e/admin'));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+
+    it('rejects a CRLF-carrying redirect and falls back to Dashboard', async () => {
+      const result = await getMainGuard()(authRouteWithRedirect('/x%0D%0ASet-Cookie:%20a=b'));
+      expect(result).toEqual({ name: 'Dashboard' });
+    });
+  });
+
+  it('should handle root path redirect for authenticated users', async () => {
+    setupRouterGuards(router);
+
+    // Index 3: main guard (0=custom-domain, 1=feature-check, 2=sso-only, 3=main)
+    const guard = vi.mocked(router.beforeEach).mock.calls[3][0] as AuthGuard;
+    const to: RouteLocationNormalized = {
+      path: '/',
+      query: {},
+      name: 'Home',
+      params: {},
+      hash: '',
+      fullPath: '/',
+      matched: [],
+      redirectedFrom: undefined,
+      meta: {}
+    };
+
+    const authStore = { isAuthenticated: true, isFullyAuthenticated: true };
+    vi.mocked(useAuthStore).mockReturnValue(authStore as ReturnType<typeof useAuthStore>);
+
+    const result = await guard(to);
+
+    expect(result).toEqual({ name: 'Dashboard' });
+  });
+
+  describe('disabled auth feature guard', () => {
+    it('should redirect /signup to / when signup is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: false, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signup' as const, isAuthRoute: true },
+        path: '/signup',
+        name: 'Sign Up',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/signup',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should allow /signup when signup is enabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signup' as const, isAuthRoute: true },
+        path: '/signup',
+        name: 'Sign Up',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/signup',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toBe(true);
+    });
+
+    it('should redirect /signin to / when signin is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: false },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/signin',
+        name: 'Sign In',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/signin',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should redirect when auth is entirely disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: false, signup: true, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signup' as const, isAuthRoute: true },
+        path: '/signup',
+        name: 'Sign Up',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/signup',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should redirect /mfa-verify to / when signin is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: false },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/mfa-verify',
+        name: 'MFA Verify',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/mfa-verify',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should redirect /reset-password to / when signin is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: false },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/reset-password',
+        name: 'Reset Password (Rodauth)',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/reset-password',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should block signin sub-routes when auth is entirely disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: false, signup: true, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/email-login',
+        name: 'Email Login',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/email-login',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should redirect /forgot to / when signin is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: false },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/forgot',
+        name: 'Forgot Password',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/forgot',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should allow /mfa-verify when signin is enabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/mfa-verify',
+        name: 'MFA Verify',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/mfa-verify',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toBe(true);
+    });
+
+    it('should redirect /email-login to / when signin is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: true, signin: false },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signin' as const, isAuthRoute: true },
+        path: '/email-login',
+        name: 'Email Login',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/email-login',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should redirect /signup/:planCode to / when signup is disabled', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({
+        authentication: { enabled: true, signup: false, signin: true },
+      });
+
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: { requiresFeature: 'signup' as const, isAuthRoute: true },
+        path: '/signup/professional',
+        name: 'Sign Up with Plan',
+        query: {},
+        params: { planCode: 'professional' },
+        hash: '',
+        fullPath: '/signup/professional',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toEqual({ path: '/' });
+    });
+
+    it('should not redirect routes without requiresFeature', () => {
+      setupRouterGuards(router);
+      const guard = vi.mocked(router.beforeEach).mock.calls[1][0] as FeatureGuard;
+      const to = {
+        meta: {},
+        path: '/some-page',
+        name: 'Some Page',
+        query: {},
+        params: {},
+        hash: '',
+        fullPath: '/some-page',
+        matched: [],
+        redirectedFrom: undefined,
+      };
+
+      const result = guard(to as RouteLocationNormalized);
+      expect(result).toBe(true);
+    });
+  });
+
+  describe('validateAuthentication', () => {
+    let mockValidator: AuthValidator & { checkWindowStatus: ReturnType<typeof vi.fn> };
+    let protectedRoute: RouteLocationNormalized;
+
+    beforeEach(() => {
+      // Create mock validator with vi.fn() for methods
+      mockValidator = {
+        needsCheck: true,
+        isAuthenticated: null,
+        checkWindowStatus: vi.fn().mockImplementation(async () => true),
+      } satisfies AuthValidator;
+
+      protectedRoute = {
+        meta: { requiresAuth: true },
+        fullPath: '/protected',
+        path: '/protected',
+        name: 'Protected',
+        params: {},
+        query: {},
+        hash: '',
+        matched: [],
+        redirectedFrom: undefined,
+      } as RouteLocationNormalized;
+    });
+
+    test('performs check when needed on protected route', async () => {
+      mockValidator.needsCheck = true;
+      const result = await validateAuthentication(mockValidator, protectedRoute);
+      expect(mockValidator.checkWindowStatus).toHaveBeenCalled();
+      expect(result).toBe(true);
+    });
+
+    test('skips check when not needed on protected route', async () => {
+      // Set up authenticated state
+      mockValidator.needsCheck = false;
+      mockValidator.isAuthenticated = true; // Add this line to indicate authenticated state
+
+      const result = await validateAuthentication(mockValidator, protectedRoute);
+      expect(mockValidator.checkWindowStatus).not.toHaveBeenCalled();
+      expect(result).toBe(true);
+    });
+
+    test('skips return false when no need for a check', async () => {
+      //  when `needsCheck` is false but `isAuthenticated` is null (the default
+      // value in our setup), the validator should return false for protected routes.
+      mockValidator.needsCheck = false;
+      const result = await validateAuthentication(mockValidator, protectedRoute);
+      expect(mockValidator.checkWindowStatus).not.toHaveBeenCalled();
+      expect(result).toBe(false);
+    });
+
+    test('always returns true for public routes', async () => {
+      mockValidator.needsCheck = true;
+      mockValidator.isAuthenticated = false;
+      const result = await validateAuthentication(mockValidator, publicRoute);
+      expect(mockValidator.checkWindowStatus).not.toHaveBeenCalled();
+      expect(result).toBe(true);
+    });
+
+    test('returns false when auth check fails', async () => {
+      mockValidator.needsCheck = true;
+      mockValidator.checkWindowStatus.mockResolvedValueOnce(false);
+      const result = await validateAuthentication(mockValidator, protectedRoute);
+      expect(result).toBe(false);
+    });
+
+    test('returns false when authenticated is null', async () => {
+      mockValidator.needsCheck = false;
+      mockValidator.isAuthenticated = null;
+      const result = await validateAuthentication(mockValidator, protectedRoute);
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('SSO-only mode guard (handleSsoOnlyRoute)', () => {
+    // Direct unit tests for handleSsoOnlyRoute — no router registration needed.
+
+    const makeRoute = (
+      overrides: Partial<RouteLocationNormalized> = {}
+    ): RouteLocationNormalized => ({
+      meta: {},
+      path: '/test',
+      name: 'Test',
+      query: {},
+      params: {},
+      hash: '',
+      fullPath: '/test',
+      matched: [],
+      redirectedFrom: undefined,
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(false);
+    });
+
+    it('should pass through routes without excludeSsoOnly meta', () => {
+      const to = makeRoute({ meta: {} });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toBeNull();
+    });
+
+    it('should pass through excludeSsoOnly routes when SSO-only mode is inactive', () => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(false);
+
+      const to = makeRoute({
+        meta: { excludeSsoOnly: true },
+        path: '/signup',
+        name: 'Sign Up',
+      });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toBeNull();
+    });
+
+    it('should redirect unauthenticated excludeSsoOnly routes to /signin when SSO-only mode is active', () => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+      vi.mocked(useAuthStore).mockReturnValue({
+        isFullyAuthenticated: false,
+      } as ReturnType<typeof useAuthStore>);
+
+      const to = makeRoute({
+        meta: { excludeSsoOnly: true },
+        path: '/signup',
+        name: 'Sign Up',
+      });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toEqual({ path: '/signin' });
+    });
+
+    it('should NOT redirect /signin to itself (prevents infinite loop)', () => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+
+      const to = makeRoute({
+        meta: { excludeSsoOnly: true },
+        path: '/signin',
+        name: 'Sign In',
+      });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toBeNull();
+    });
+
+    it('should redirect /forgot when SSO-only mode is active (unauthenticated)', () => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+      vi.mocked(useAuthStore).mockReturnValue({
+        isFullyAuthenticated: false,
+      } as ReturnType<typeof useAuthStore>);
+
+      const to = makeRoute({
+        meta: { excludeSsoOnly: true },
+        path: '/forgot',
+        name: 'Forgot Password',
+      });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toEqual({ path: '/signin' });
+    });
+
+    it('should redirect /reset-password when SSO-only mode is active (unauthenticated)', () => {
+      vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+      vi.mocked(useAuthStore).mockReturnValue({
+        isFullyAuthenticated: false,
+      } as ReturnType<typeof useAuthStore>);
+
+      const to = makeRoute({
+        meta: { excludeSsoOnly: true },
+        path: '/reset-password',
+        name: 'Reset Password',
+      });
+
+      const result = handleSsoOnlyRoute(to);
+      expect(result).toEqual({ path: '/signin' });
+    });
+
+    describe('redirect target based on auth store state', () => {
+      // The redirect decision now depends on authStore.isFullyAuthenticated,
+      // NOT on route metadata (requiresAuth). This prevents double-redirects
+      // when an authenticated user hits a public excludeSsoOnly route.
+
+      it('should redirect authenticated user on auth-required excluded route to /account', () => {
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+        vi.mocked(useAuthStore).mockReturnValue({
+          isFullyAuthenticated: true,
+        } as ReturnType<typeof useAuthStore>);
+
+        const to = makeRoute({
+          meta: { excludeSsoOnly: true, requiresAuth: true },
+          path: '/account/region',
+          name: 'Data Region',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toEqual({ path: '/account' });
+      });
+
+      it('should redirect authenticated user on public excluded route to /account', () => {
+        // This is the key behavioral change: previously this would wrongly
+        // redirect to /signin because it checked requiresAuth (false here),
+        // but now it checks isFullyAuthenticated from the auth store.
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+        vi.mocked(useAuthStore).mockReturnValue({
+          isFullyAuthenticated: true,
+        } as ReturnType<typeof useAuthStore>);
+
+        const to = makeRoute({
+          meta: { excludeSsoOnly: true, requiresAuth: false },
+          path: '/signup',
+          name: 'Sign Up',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toEqual({ path: '/account' });
+      });
+
+      it('should redirect unauthenticated user on auth-required excluded route to /signin', () => {
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+        vi.mocked(useAuthStore).mockReturnValue({
+          isFullyAuthenticated: false,
+        } as ReturnType<typeof useAuthStore>);
+
+        const to = makeRoute({
+          meta: { excludeSsoOnly: true, requiresAuth: true },
+          path: '/account/region',
+          name: 'Data Region',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toEqual({ path: '/signin' });
+      });
+
+      it('should redirect unauthenticated user on public excluded route to /signin', () => {
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+        vi.mocked(useAuthStore).mockReturnValue({
+          isFullyAuthenticated: false,
+        } as ReturnType<typeof useAuthStore>);
+
+        const to = makeRoute({
+          meta: { excludeSsoOnly: true },
+          path: '/forgot',
+          name: 'Forgot Password',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toEqual({ path: '/signin' });
+      });
+    });
+
+    describe('requiredInSsoOnly precedence', () => {
+      // Precedence over excludeSsoOnly — see requiredInSsoOnly in
+      // src/types/router.ts. No real route carries both flags (the sweep spec
+      // forbids the combination), so the double-flag case uses a synthetic
+      // route location.
+
+      it('allows a requiredInSsoOnly route when SSO-only mode is active', () => {
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+
+        const to = makeRoute({
+          meta: { requiredInSsoOnly: true },
+          path: '/sso-link-confirm/abc123',
+          name: 'SSO Link Confirm',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toBeNull();
+      });
+
+      it('allows a synthetic double-flagged route (requiredInSsoOnly wins) and warns via loggingService', () => {
+        vi.mocked(isSsoOnlyMode).mockReturnValue(true);
+        vi.mocked(useAuthStore).mockReturnValue({
+          isFullyAuthenticated: false,
+        } as ReturnType<typeof useAuthStore>);
+        const warnSpy = vi
+          .spyOn(loggingService, 'warn')
+          .mockImplementation(() => {});
+
+        // Without the precedence early-return this would redirect to /signin.
+        const to = makeRoute({
+          meta: { requiredInSsoOnly: true, excludeSsoOnly: true },
+          path: '/mfa-verify',
+          name: 'MFA Verify',
+        });
+
+        const result = handleSsoOnlyRoute(to);
+        expect(result).toBeNull();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('requiredInSsoOnly'),
+          { path: '/mfa-verify' }
+        );
+
+        warnSpy.mockRestore();
+      });
+    });
+  });
+
+  describe('org-role requirement guard (handleOrgRoleRequirement)', () => {
+    // Direct unit tests for handleOrgRoleRequirement. The organization store is
+    // mocked so each test controls cached orgs, list-fetched state, and fetch
+    // outcomes without hitting the API.
+
+    type OrgRecord = { extid: string; current_user_role: string | null };
+
+    const makeStore = (overrides: Record<string, unknown> = {}) =>
+      ({
+        isListFetched: true,
+        organizations: [] as OrgRecord[],
+        currentOrganization: null as OrgRecord | null,
+        getOrganizationByExtid: (_extid: string): OrgRecord | undefined => undefined,
+        fetchOrganizations: vi.fn(async () => []),
+        fetchOrganization: vi.fn(async () => {
+          throw new Error('not found');
+        }),
+        ...overrides,
+      }) as unknown as ReturnType<typeof useOrganizationStore>;
+
+    const makeRoute = (
+      overrides: Partial<RouteLocationNormalized> = {}
+    ): RouteLocationNormalized => ({
+      meta: {},
+      path: '/test',
+      name: 'Test',
+      query: {},
+      params: {},
+      hash: '',
+      fullPath: '/test',
+      matched: [],
+      redirectedFrom: undefined,
+      ...overrides,
+    });
+
+    const useStore = (store: ReturnType<typeof useOrganizationStore>) =>
+      vi.mocked(useOrganizationStore).mockReturnValue(store);
+
+    it('allows routes without requiresOrgRole', async () => {
+      useStore(makeStore());
+      const result = await handleOrgRoleRequirement(makeRoute({ meta: {} }));
+      expect(result).toBeNull();
+    });
+
+    describe('list page (/orgs, no org in path)', () => {
+      it('allows when the user owns at least one org', async () => {
+        useStore(makeStore({ organizations: [{ extid: 'on1', current_user_role: 'member' }, { extid: 'on2', current_user_role: 'owner' }] }));
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ path: '/orgs', meta: { requiresOrgRole: 'owner' } })
+        );
+        expect(result).toBeNull();
+      });
+
+      it('redirects to /dashboard when the user owns no org', async () => {
+        useStore(makeStore({ organizations: [{ extid: 'on1', current_user_role: 'admin' }, { extid: 'on2', current_user_role: 'member' }] }));
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ path: '/orgs', meta: { requiresOrgRole: 'owner' } })
+        );
+        expect(result).toEqual({ path: '/dashboard' });
+      });
+
+      it('fetches the list first when not yet loaded, then decides', async () => {
+        const store = makeStore({
+          isListFetched: false,
+          organizations: [{ extid: 'on1', current_user_role: 'owner' }],
+        });
+        useStore(store);
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ path: '/orgs', meta: { requiresOrgRole: 'owner' } })
+        );
+        expect(store.fetchOrganizations).toHaveBeenCalled();
+        expect(result).toBeNull();
+      });
+
+      it('fails closed (redirect) when the list fetch rejects', async () => {
+        useStore(
+          makeStore({
+            isListFetched: false,
+            fetchOrganizations: vi.fn(async () => {
+              throw new Error('network');
+            }),
+          })
+        );
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ path: '/orgs', meta: { requiresOrgRole: 'owner' } })
+        );
+        expect(result).toEqual({ path: '/dashboard' });
+      });
+    });
+
+    describe('single-org route (:extid / :orgid in path)', () => {
+      it('allows an admin when admin is required', async () => {
+        useStore(makeStore({ getOrganizationByExtid: () => ({ extid: 'on1', current_user_role: 'admin' }) }));
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { extid: 'on1' }, meta: { requiresOrgRole: 'admin' } })
+        );
+        expect(result).toBeNull();
+      });
+
+      it('redirects a member away from an admin-only route', async () => {
+        useStore(makeStore({ getOrganizationByExtid: () => ({ extid: 'on1', current_user_role: 'member' }) }));
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { extid: 'on1' }, meta: { requiresOrgRole: 'admin' } })
+        );
+        expect(result).toEqual({ path: '/dashboard' });
+      });
+
+      it('redirects an admin away from an owner-only route', async () => {
+        useStore(makeStore({ getOrganizationByExtid: () => ({ extid: 'on1', current_user_role: 'admin' }) }));
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { extid: 'on1' }, meta: { requiresOrgRole: 'owner' } })
+        );
+        expect(result).toEqual({ path: '/dashboard' });
+      });
+
+      it('resolves the org from :orgid even when :extid (the domain id) is also present', async () => {
+        // Domain routes are /org/:orgid/domains/:extid — both params exist and
+        // :extid is the domain, not the org. The lookup must use :orgid. The
+        // mock only knows 'on1', so a wrong key (e.g. the domain id) misses and
+        // would fall through to a rejecting fetch → redirect.
+        useStore(
+          makeStore({
+            getOrganizationByExtid: (key: string) =>
+              key === 'on1' ? { extid: 'on1', current_user_role: 'owner' } : undefined,
+          })
+        );
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { orgid: 'on1', extid: 'dom5' }, meta: { requiresOrgRole: 'admin' } })
+        );
+        expect(result).toBeNull();
+      });
+
+      it('fetches the org when the role is unknown, then allows', async () => {
+        const store = makeStore({
+          getOrganizationByExtid: () => undefined,
+          fetchOrganization: vi.fn(async () => ({ extid: 'on1', current_user_role: 'admin' })),
+        });
+        useStore(store);
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { extid: 'on1' }, meta: { requiresOrgRole: 'admin' } })
+        );
+        expect(store.fetchOrganization).toHaveBeenCalledWith('on1');
+        expect(result).toBeNull();
+      });
+
+      it('fails closed (redirect) when the org fetch rejects (e.g. non-member 403)', async () => {
+        useStore(
+          makeStore({
+            getOrganizationByExtid: () => undefined,
+            fetchOrganization: vi.fn(async () => {
+              throw new Error('forbidden');
+            }),
+          })
+        );
+        const result = await handleOrgRoleRequirement(
+          makeRoute({ params: { extid: 'on1' }, meta: { requiresOrgRole: 'admin' } })
+        );
+        expect(result).toEqual({ path: '/dashboard' });
+      });
+    });
+  });
+
+  describe('colonel requirement guard (handleColonelRequirement, M-10)', () => {
+    // Direct unit tests. Non-colonels are hard-navigated out of the admin bundle
+    // via window.location.assign('/') (the admin router has no /dashboard or
+    // /signin to SPA-redirect to), and the guard returns false to abort the nav.
+
+    const makeRoute = (
+      overrides: Partial<RouteLocationNormalized> = {}
+    ): RouteLocationNormalized => ({
+      meta: {},
+      path: '/colonel',
+      name: 'AdminOverview',
+      query: {},
+      params: {},
+      hash: '',
+      fullPath: '/colonel',
+      matched: [],
+      redirectedFrom: undefined,
+      ...overrides,
+    });
+
+    let originalLocation: Location;
+    let assignMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+      originalLocation = window.location;
+      assignMock = vi.fn();
+      Object.defineProperty(window, 'location', {
+        value: { assign: assignMock },
+        writable: true,
+        configurable: true,
+      });
+    });
+
+    afterEach(() => {
+      Object.defineProperty(window, 'location', {
+        value: originalLocation,
+        writable: true,
+        configurable: true,
+      });
+    });
+
+    it('allows routes without requiresColonel (no-op on the customer router)', () => {
+      const result = handleColonelRequirement(makeRoute({ meta: {} }));
+      expect(result).toBeNull();
+      expect(assignMock).not.toHaveBeenCalled();
+    });
+
+    it('allows a colonel on a requiresColonel route', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ cust: { role: 'colonel' } });
+
+      const result = handleColonelRequirement(makeRoute({ meta: { requiresColonel: true } }));
+      expect(result).toBeNull();
+      expect(assignMock).not.toHaveBeenCalled();
+    });
+
+    it('hard-navigates a non-colonel out of the admin bundle and aborts the nav', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ cust: { role: 'customer' } });
+
+      const result = handleColonelRequirement(makeRoute({ meta: { requiresColonel: true } }));
+      expect(assignMock).toHaveBeenCalledWith('/');
+      expect(result).toBe(false);
+    });
+
+    it('hard-navigates when no customer is present (fails closed)', () => {
+      const bootstrapStore = useBootstrapStore();
+      bootstrapStore.$patch({ cust: null });
+
+      const result = handleColonelRequirement(makeRoute({ meta: { requiresColonel: true } }));
+      expect(assignMock).toHaveBeenCalledWith('/');
+      expect(result).toBe(false);
+    });
+  });
+});

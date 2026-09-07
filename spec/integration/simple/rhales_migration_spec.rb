@@ -1,0 +1,405 @@
+# spec/integration/simple/rhales_migration_spec.rb
+#
+# frozen_string_literal: true
+
+require_relative '../integration_spec_helper'
+require 'nokogiri'
+
+RSpec.describe 'Rhales Migration Integration', type: :integration do
+  # Initialize OT configuration for views
+  before(:all) do
+    # Configure I18n to accept :en locale (normally done by OT.boot!)
+    I18n.available_locales = [:en]
+    I18n.default_locale = :en
+
+    # Configure Runtime.internationalization (required by MiddlewareStack.build_available_locales)
+    # This is the proper way to set locale configuration since v0.21+
+    Onetime::Runtime.internationalization = Onetime::Runtime::Internationalization.new(
+      enabled: true,
+      supported_locales: ['en'],
+      default_locale: 'en',
+      fallback_locale: 'en',
+      locales: {
+        'en' => {
+          code: 'en',
+          name: 'English',
+          web: {
+            COMMON: {
+              title: 'Onetime Secret',
+              tagline: 'Keep sensitive info out of your email & chat logs.'
+            }
+          }
+        }
+      },
+      date_format: 'locale',
+      datetime_format: 'locale',
+    )
+
+    # Save original config for restoration in after(:all)
+    @__original_ot_conf_before_all = OT.conf
+
+    # Set minimal OT configuration - must include site.secret for Session middleware
+    mock_config = {
+      'site' => {
+        'host' => 'localhost:7143',
+        'domain' => 'localhost',
+        'ssl' => false,
+        'secret' => 'test-secret-for-rhales-migration-spec',
+        # Masthead layout knobs only — brand identity lives in the brand:
+        # block below (#3612 retired the header.branding nesting).
+        'interface' => {
+          'ui' => {
+            'header' => {
+              'enabled' => true,
+              'logo' => {}
+            }
+          }
+        }
+      },
+      # page_title falls through display_domain -> brand_product_name, which
+      # reads brand.product_name only (the legacy header.branding.site_name
+      # tier was retired in #3612). Without this the rendered <title> would
+      # be empty.
+      # og_image_url mirrors what Config#normalize_brand resolves at boot for a
+      # pack carrying social-preview.png (the tracked default does) — this mock
+      # bypasses normalize_brand, so it has to state the resolved value (#4150).
+      'brand' => { 'product_name' => 'One-Time Secret', 'og_image_url' => '/social-preview.png' },
+      'development' => { 'enabled' => false },
+      'diagnostics' => {},
+      'billing' => { 'enabled' => false }
+    }
+    OT.instance_variable_set(:@conf, mock_config)
+
+    # Configure Rhales template paths (normally done by ConfigureRhales initializer)
+    unless Rhales.configuration.frozen?
+      Rhales.configure do |config|
+        config.nonce_header_name = 'onetime.nonce'
+        config.hydration.injection_strategy = :earliest
+        config.hydration_authority = :schema
+        config.hydration.mount_point_selectors = ['#app']
+        templates_dir = File.join(OT::HOME, 'apps', 'web', 'core', 'templates')
+        config.template_paths = [templates_dir]
+        config.allowed_unescaped_variables = ['vite_assets_html']
+      end
+    end
+  end
+
+  after(:all) do
+    # Restore original config to prevent test pollution
+    OT.instance_variable_set(:@conf, @__original_ot_conf_before_all) if @__original_ot_conf_before_all
+  end
+
+  let(:session) { { 'csrf' => 'test-csrf-token-12345' } }
+  let(:customer) { nil } # Anonymous users have nil customer
+  let(:locale) { 'en' }
+  let(:nonce) { SecureRandom.base64(32) }
+
+  # Mock Otto StrategyResult
+  let(:strategy_result) do
+    double('StrategyResult',
+      session: session,
+      user: customer,
+      authenticated?: false,
+      metadata: {}
+    )
+  end
+
+  let(:request) do
+    env_hash = {
+      'onetime.nonce' => nonce,
+      'otto.locale' => locale,
+      'rack.session' => session,
+      'otto.strategy_result' => strategy_result
+    }
+
+    double('Request',
+      env: env_hash,
+      locale: locale,
+      user: customer,
+      session: session,
+      authenticated?: false,
+      nonce: nonce,
+      strategy_result: strategy_result
+    ).tap do |req|
+      # Allow env to respond to fetch for i18n helpers
+      allow(req.env).to receive(:fetch).and_call_original
+    end
+  end
+
+  describe 'VuePoint rendering with Rhales' do
+    let(:view) { Core::Views::VuePoint.new(request) }
+    let(:rendered_html) { view.render('index') }
+    let(:doc) { Nokogiri::HTML(rendered_html) }
+
+    context 'CSP Nonce Propagation' do
+      it 'applies nonce to dark mode script' do
+        dark_mode_script = doc.css('head script').first
+        expect(dark_mode_script['nonce']).to eq(nonce)
+      end
+
+      it 'applies nonce to all link tags' do
+        doc.css('link[nonce]').each do |link|
+          expect(link['nonce']).to eq(nonce)
+        end
+      end
+
+      it 'applies nonce to Vite asset scripts' do
+        vite_scripts = doc.css('script[src*="/dist/"]')
+        # Skip assertion if Vite manifest not available (CI without frontend build)
+        skip 'Vite manifest not available' if vite_scripts.empty?
+        vite_scripts.each do |script|
+          expect(script['nonce']).to eq(nonce)
+        end
+      end
+
+      it 'includes nonce in hydration script' do
+        hydration_script = doc.css('script[type="application/json"]').first
+        expect(hydration_script['nonce']).to eq(nonce)
+      end
+    end
+
+    context 'Serializer Data Hydration' do
+      let(:state_script) { doc.css('script[type="application/json"]').first }
+      let(:state_data) { JSON.parse(state_script.content) }
+
+      it 'includes serializer outputs from all registered serializers' do
+        # ConfigSerializer outputs
+        expect(state_data).to have_key('secret_options')
+        # AuthenticationSerializer outputs
+        expect(state_data).to have_key('authenticated')
+        expect(state_data).to have_key('cust')
+        # DomainSerializer outputs
+        expect(state_data).to have_key('domain_strategy')
+        # I18nSerializer outputs
+        expect(state_data).to have_key('locale')
+        # MessagesSerializer outputs
+        expect(state_data).to have_key('messages')
+        # SystemSerializer outputs
+        expect(state_data).to have_key('ot_version')
+        expect(state_data).to have_key('shrimp')
+      end
+
+      it 'includes authenticated flag' do
+        expect(state_data).to have_key('authenticated')
+      end
+
+      it 'includes locale' do
+        expect(state_data['locale']).to eq(locale)
+      end
+
+      it 'initializes messages as empty or nil' do
+        # Messages start as nil in view_vars and are only populated when add_message is called
+        expect(state_data['messages']).to satisfy { |m| m.nil? || m == [] }
+      end
+
+      it 'sets window variable name to __BOOTSTRAP_ME__' do
+        # Rhales uses data-window attribute to specify the window variable name
+        # The hydration script reads this and sets window[name] = parsed JSON
+        expect(rendered_html).to include('data-window="__BOOTSTRAP_ME__"')
+      end
+    end
+
+    context 'JSON Sanitization' do
+      # Note: Messages are serialized at view initialization time.
+      # These tests verify that the JSON state data is valid and properly encoded.
+
+      it 'produces valid JSON in hydration script' do
+        state_script = doc.css('script[type="application/json"]').first
+        expect(state_script).not_to be_nil
+        expect { JSON.parse(state_script.content) }.not_to raise_error
+      end
+
+      it 'handles special characters in serialized data' do
+        # The serialized data contains various strings that may have special chars
+        state_script = doc.css('script[type="application/json"]').first
+        state_data = JSON.parse(state_script.content)
+
+        # Verify JSON parsing succeeded - special characters are properly escaped
+        expect(state_data).to be_a(Hash)
+        expect(state_data).to have_key('ot_version')
+      end
+
+      it 'escapes angle brackets in JSON to prevent XSS' do
+        state_script = doc.css('script[type="application/json"]').first
+        # The raw script content should not contain unescaped </script>
+        # If it did, it would prematurely close the JSON script tag
+        expect(state_script.content).not_to include('</script>')
+      end
+    end
+
+    context 'Partial Rendering' do
+      it 'renders head partial' do
+        expect(doc.css('meta[charset="UTF-8"]')).not_to be_empty
+      end
+
+      it 'includes all meta tags from head partial' do
+        expect(doc.css('meta[name="viewport"]')).not_to be_empty
+        expect(doc.css('meta[name="referrer"]')).not_to be_empty
+        expect(doc.css('meta[property="og:url"]')).not_to be_empty
+        expect(doc.css('meta[name="twitter:card"]')).not_to be_empty
+      end
+
+      it 'renders page title from props' do
+        expect(doc.css('title').text).not_to be_empty
+      end
+
+      it 'includes favicon links' do
+        expect(doc.css('link[rel="icon"]')).not_to be_empty
+      end
+    end
+
+    context 'Favicon and social variety pack' do
+      it 'emits the neutral SVG favicon for canonical installs (no brand override)' do
+        svg_icon = doc.css('link[rel="icon"][type="image/svg+xml"]')
+        expect(svg_icon).not_to be_empty
+        expect(svg_icon.first['href']).to eq('/favicon.svg')
+      end
+
+      it 'still emits the legacy .ico favicon link' do
+        hrefs = doc.css('link[rel="icon"]').map { |l| l['href'] }
+        expect(hrefs).to include('/favicon.ico')
+      end
+
+      it 'emits the apple-touch-icon link' do
+        expect(doc.css('link[rel="apple-touch-icon"]')).not_to be_empty
+      end
+
+      it 'emits the web manifest link' do
+        expect(doc.css('link[rel="manifest"]')).not_to be_empty
+      end
+
+      # A pack carrying social-preview.png emits both tags with an ABSOLUTE URL
+      # (social scrapers will not resolve a relative one) and the large-image
+      # card type. The imageless posture is asserted below (#4150).
+      it 'emits og:image and twitter:image' do
+        expect(doc.css('meta[property="og:image"]')).not_to be_empty
+        expect(doc.css('meta[name="twitter:image"]')).not_to be_empty
+      end
+
+      it 'emits an absolute og:image URL' do
+        expect(doc.css('meta[property="og:image"]').first['content']).to match(%r{\Ahttps?://})
+      end
+
+      it 'emits twitter:card as summary_large_image when a card is present' do
+        expect(doc.css('meta[name="twitter:card"]').first&.[]('content')).to eq('summary_large_image')
+      end
+
+      # The opt-out posture (BRAND_OG_IMAGE_URL=none, or a pack carrying no card)
+      # reaches the view as a nil brand.og_image_url. Proven at the RENDER layer:
+      # the tags must be absent entirely, not emitted empty or pointing at a URL
+      # that 404s, and the card type must degrade so the preview still renders.
+      context 'with no social card' do
+        before do
+          @saved_brand   = OT.conf['brand']
+          OT.conf['brand'] = @saved_brand.merge('og_image_url' => nil)
+        end
+
+        after { OT.conf['brand'] = @saved_brand }
+
+        it 'omits og:image and twitter:image entirely' do
+          expect(doc.css('meta[property="og:image"]')).to be_empty
+          expect(doc.css('meta[name="twitter:image"]')).to be_empty
+        end
+
+        it 'degrades twitter:card to summary' do
+          expect(doc.css('meta[name="twitter:card"]').first&.[]('content')).to eq('summary')
+        end
+      end
+
+      it 'emits mobile web app metadata' do
+        expect(doc.css('meta[name="apple-mobile-web-app-title"]')).not_to be_empty
+        expect(doc.css('meta[name="application-name"]')).not_to be_empty
+      end
+    end
+
+    context 'Vite Asset Loading' do
+      # Note: These tests verify that vite_assets_html is included in the template.
+      # The actual asset paths depend on whether a manifest exists and development mode.
+      # More detailed Vite behavior is tested in unit tests.
+
+      it 'includes script tags for Vite assets' do
+        # The template should include script tags for the main entry point
+        # In test mode without manifest, it may use fallback or dev mode paths
+        vite_scripts = doc.css('script[type="module"]')
+        # Skip if Vite manifest not available (CI without frontend build)
+        skip 'Vite manifest not available' if vite_scripts.empty?
+      end
+
+      it 'applies nonces to Vite script tags' do
+        module_scripts = doc.css('script[type="module"][nonce]')
+        module_scripts.each do |script|
+          expect(script['nonce']).to eq(nonce)
+        end
+      end
+    end
+
+    context 'CSRF Token' do
+      it 'delivers CSRF via shrimp in serialized state (not meta tag)' do
+        # CSRF is delivered via window.__BOOTSTRAP_ME__.shrimp and X-CSRF-Token header
+        # No meta tag - frontend reads from window state, updates from response headers
+        state_script = doc.css('script[type="application/json"]').first
+        state_data = JSON.parse(state_script.content)
+        expect(state_data).to have_key('shrimp')
+      end
+    end
+
+    context 'Dark Mode Script' do
+      it 'includes dark mode initialization script' do
+        expect(rendered_html).to include('prefers-color-scheme: dark')
+        expect(rendered_html).to include('adjustVisualEnvironment')
+      end
+
+      it 'positions dark mode script as first child of head' do
+        first_script = doc.css('head script').first
+        expect(first_script.content).to include('prefers-color-scheme: dark')
+      end
+
+      it 'applies nonce to dark mode script' do
+        first_script = doc.css('head script').first
+        expect(first_script['nonce']).to eq(nonce)
+      end
+
+      it 'sets up dark/light mode classes' do
+        expect(rendered_html).to include('addClass: \'dark\'')
+        expect(rendered_html).to include('addClass: \'light\'')
+      end
+    end
+
+    context 'Vue.js SPA Structure' do
+      it 'includes #app mount point' do
+        app_div = doc.css('#app').first
+        expect(app_div).not_to be_nil
+      end
+
+      it 'includes fallback content inside #app' do
+        # Vue replaces this fallback when mounted; server-rendered HTML has loading state
+        fallback_div = doc.css('#app .app-fallback').first
+        expect(fallback_div).not_to be_nil
+      end
+
+      it 'sets html lang attribute from locale' do
+        expect(doc.css('html').first['lang']).to eq(locale)
+      end
+
+      it 'applies initial light mode class to html' do
+        expect(doc.css('html').first['class']).to include('light')
+      end
+    end
+
+    context 'Backward Compatibility' do
+      it 'maintains same HTML structure' do
+        # Verify essential structure elements
+        expect(doc.css('html').length).to eq(1)
+        expect(doc.css('head').length).to eq(1)
+        expect(doc.css('body').length).to eq(1)
+        expect(doc.css('#app').length).to eq(1)
+      end
+
+      it 'preserves all meta tags from original template' do
+        # Count meta tags (should match original count)
+        meta_tags = doc.css('meta')
+        expect(meta_tags.length).to be >= 15  # Original has 15+ meta tags
+      end
+    end
+  end
+end

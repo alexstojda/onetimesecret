@@ -1,12 +1,23 @@
 # apps/web/core/views/serializers/registry.rb
+#
+# frozen_string_literal: true
 
 require 'tsort'
+require 'onetime/logger_methods'
 
 # Dependencies-aware registry for view serializers
 #
 # The SerializerRegistry manages the registration, dependency resolution, and execution
 # of serializers in the correct order. It uses Ruby's TSort module to handle dependency
 # ordering.
+#
+# Schema Principle:
+# Bootstrap data is internal communication between backend and frontend — we control
+# both sides completely. Therefore:
+# - Use native types (true/false, integers, ISO timestamps) not string encodings
+# - No backwards compatibility layers or legacy field names
+# - Keep fields current; remove unused fields promptly
+# - Frontend types: src/schemas/contracts/bootstrap.ts (via z.infer)
 #
 # For this use case, module methods are preferable because:
 #
@@ -24,7 +35,9 @@ module Core
   module Views
     class SerializerRegistry
       extend TSort
-      @serializers = []
+      extend Onetime::LoggerMethods
+
+      @serializers  = []
       @dependencies = {}
 
       class << self
@@ -44,41 +57,59 @@ module Core
         #
         # @param serializer_list [Array<Module>] List of serializers to execute
         # @param vars [Hash] View variables to pass to each serializer
-        # @param i18n [Object] Internationalization instance
         # @return [Hash] Combined output from all serializers
-        def run(serializer_list, vars, i18n)
-          ordered = sorted_serializers.select { |s| serializer_list.include?(s) }
+        def run(serializer_list, vars)
+          ordered   = sorted_serializers.select { |s| serializer_list.include?(s) }
           seen_keys = {}
 
           ordered.reduce({}) do |result, serializer|
-            output = serializer.serialize(vars, i18n)
+            output = serializer.serialize(vars)
             if output.nil?
-              OT.le "[SerializerRegistry] Warning: #{serializer} returned nil"
+              app_logger.warn 'Serializer returned nil',
+                {
+                  serializer: serializer.to_s,
+                  module: 'SerializerRegistry',
+                }
               next result
             end
 
-            output.each_key do |key|
-              # Detect keys that are not defined in the serializer output_template
-              unless serializer.output_template.key?(key)
-                OT.le "[SerializerRegistry] Warning: Key '#{key}' not defined in #{serializer}"
-              end
+            # Strip keys that are not defined in the serializer
+            # output_template. The template is the output boundary schema: a
+            # key a serializer never declared must not reach the bootstrap
+            # payload, even by accident. This guards top-level keys only —
+            # nested subtrees are each serializer's job to allowlist (e.g.
+            # ConfigSerializer#transform_domains).
+            #
+            # output_template builds a fresh hash on every call, so hoist it
+            # out of the block rather than rebuilding it once per output key.
+            template             = serializer.output_template
+            declared, undeclared = output.partition { |key, _| template.key?(key) }.map(&:to_h)
 
+            undeclared.each_key do |key|
+              app_logger.warn 'Serializer key not in output template; stripped',
+                {
+                  key: key,
+                  serializer: serializer.to_s,
+                  module: 'SerializerRegistry',
+                }
+            end
+
+            declared.each_key do |key|
               # Detect key collisions with output from previous serializers
               if seen_keys.key?(key)
-                collision_msg = <<~MSG
-                  [SerializerRegistry] Warning: Key collision detected
-                  Key: '#{key}'
-                  First defined by: #{seen_keys[key]}
-                  Then defined by: #{serializer}
-                MSG
-                OT.le collision_msg
+                app_logger.warn 'Serializer key collision detected',
+                  {
+                    key: key,
+                    first_defined_by: seen_keys[key].to_s,
+                    then_defined_by: serializer.to_s,
+                    module: 'SerializerRegistry',
+                  }
               else
                 seen_keys[key] = serializer
               end
             end
 
-            OT.ld "[SerializerRegistry] Executing serializer: #{serializer}"
-            result.merge(output)
+            result.merge(declared)
           end
         end
 
@@ -98,7 +129,6 @@ module Core
           dependencies.fetch(node, []).each(&)
         end
       end
-
     end
   end
 end

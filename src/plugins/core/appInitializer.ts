@@ -2,25 +2,34 @@
 
 import { createApi } from '@/api';
 import i18n from '@/i18n';
-import { createAppRouter } from '@/router';
+import { setupRouterGuards } from '@/router/guards.routes';
+import { consumeBootstrapData, getBootstrapValue } from '@/services/bootstrap.service';
 import { loggingService } from '@/services/logging.service';
-import { WindowService } from '@/services/window.service';
+import { setAllowedCheckoutHost } from '@/utils/redirect';
 import { AxiosInstance } from 'axios';
 import { createPinia } from 'pinia';
 import { App, Plugin } from 'vue';
+import type { Router } from 'vue-router';
 
 import { createDiagnostics } from './enableDiagnostics';
 import { createErrorBoundary } from './globalErrorBoundary';
 import { autoInitPlugin } from '../pinia/autoInitPlugin';
 
 interface AppInitializerOptions {
+  /**
+   * The router to install. Injected by the caller (main.ts / admin.ts) so this
+   * initializer does NOT import `@/router` itself — that keeps the customer
+   * route graph out of the admin bundle (and vice versa) under the single-chunk
+   * build. Each entry supplies its own router.
+   */
+  router: Router;
   api?: AxiosInstance;
   debug?: boolean;
 }
 
 /** Makes initializeApp available as a proper Vue plugin */
 export const AppInitializer: Plugin<AppInitializerOptions> = {
-  install(app: App, options: AppInitializerOptions = {}) {
+  install(app: App, options: AppInitializerOptions) {
     initializeApp(app, options);
   },
 };
@@ -38,21 +47,40 @@ export const AppInitializer: Plugin<AppInitializerOptions> = {
  *
  * We separate this from the main plugin to interface for testing purposes.
  */
-/*eslint max-statements: ["error", 20]*/
-function initializeApp(app: App, options: AppInitializerOptions = {}) {
-  const diagnostics = WindowService.get('diagnostics');
-  const d9sEnabled = WindowService.get('d9s_enabled');
-  const displayDomain = WindowService.get('display_domain');
-  const siteHost = WindowService.get('site_host');
-  const router = createAppRouter();
+/*eslint max-statements: ["error", 24]*/
+function initializeApp(app: App, options: AppInitializerOptions) {
+  // Consume bootstrap data early, before Pinia is installed.
+  // This populates the snapshot for getBootstrapValue() calls.
+  consumeBootstrapData();
+
+  const diagnostics = getBootstrapValue('diagnostics');
+  const d9sEnabled = getBootstrapValue('d9s_enabled');
+  const displayDomain = getBootstrapValue('display_domain');
+  const siteHost = getBootstrapValue('site_host');
+
+  // Seed the checkout-URL host allowlist with this deployment's Stripe
+  // custom-domain host (bare host, empty when unconfigured). Must run before
+  // any billing/checkout response is parsed; checkout only happens on user
+  // action, well after init.
+  setAllowedCheckoutHost(getBootstrapValue('checkout_host'));
+
+  const router = options.router;
   const pinia = createPinia();
   const api = options.api ?? createApi();
 
-  if (d9sEnabled) {
-    // Create plugin instances
+  if (d9sEnabled && diagnostics) {
+    // Fail loudly if diagnostics is enabled but host is missing
+    const host = displayDomain ?? siteHost;
+    if (!host) {
+      throw new Error(
+        '[AppInitializer] Diagnostics enabled but no host available. ' +
+          'Expected display_domain or site_host in bootstrap data.'
+      );
+    }
+
     const diagnosticsPlugin = createDiagnostics({
-      host: displayDomain ?? siteHost,
-      config: diagnostics,
+      host,
+      config: diagnostics!, // checked above: `if (d9sEnabled && diagnostics)`
       router,
     });
 
@@ -66,8 +94,13 @@ function initializeApp(app: App, options: AppInitializerOptions = {}) {
   });
 
   // Register auto-init plugin before creating stores. We pass the api client
-  // to the plugin so it can be used by stores.
-  pinia.use(autoInitPlugin(options));
+  // and browser locale to the plugin so stores can use them during init.
+  pinia.use(
+    autoInitPlugin({
+      api,
+      deviceLocale: navigator.language,
+    })
+  );
 
   // Make API client available to Vue app (and pinia stores)
   // NOTE: In our unit tests we need to explicitly provide an API client
@@ -77,6 +110,11 @@ function initializeApp(app: App, options: AppInitializerOptions = {}) {
   app.use(pinia);
   app.use(errorBoundary);
   app.use(i18n);
+
+  // Set up router guards AFTER Pinia is installed.
+  // Guards use stores (usePageTitle, useAuthStore, etc.) which require Pinia.
+  setupRouterGuards(router);
+
   app.use(router);
 
   // Display startup banner

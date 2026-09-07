@@ -1,16 +1,75 @@
 # apps/api/v2/logic/secrets/generate_secret.rb
+#
+# frozen_string_literal: true
 
 require_relative 'base_secret_action'
 
 module V2::Logic
   module Secrets
-    class GenerateSecret < BaseSecretAction
+    using Familia::Refinements::TimeLiterals
 
-      def process_secret
-        @kind = :generate
-        @secret_value = Onetime::Utils.strand(12)
+    # Generate Secret
+    #
+    # @api Creates a new secret with a randomly generated value. Accepts
+    #   optional password generation parameters (length, character sets),
+    #   TTL, recipient email, and share domain. Returns the receipt and
+    #   secret records with share URLs.
+    class GenerateSecret < BaseSecretAction
+      include Onetime::Logic::GuestRouteGating
+
+      SCHEMAS = { response: 'concealData', request: 'generateSecret' }.freeze
+
+      def raise_concerns
+        require_guest_route_enabled!(:generate)
+        super
       end
 
+      def process_secret
+        @kind = 'generate'
+
+        # Get password generation configuration
+        password_config = OT.conf.dig('site', 'secret_options', 'password_generation') || {}
+
+        # Convert config keys to strings and merge with payload
+        #
+        # This is compatible with both v0.22 (mostly symbols) and v1.0
+        # configuration (all strings).
+        maxlen_config            = password_config.fetch('maximum_length', nil)
+        config_with_string_keys  = password_config.transform_keys(&:to_s)
+        payload_with_string_keys = payload.transform_keys(&:to_s)
+        merged_options           = config_with_string_keys.merge(payload_with_string_keys)
+
+        # Extract parameters from merged options
+        length = merged_options['length']&.to_i || merged_options['default_length'] || 12
+
+        # Reject oversized lengths BEFORE strand allocates. process_secret runs
+        # in the constructor (via process_params, BEFORE raise_concerns), so this
+        # is the last guard ahead of the allocation — capping in raise_concerns
+        # would be too late, the oversized string is already built. Read the
+        # ceiling from CONFIG (not merged_options) so a payload key like
+        # secret[maximum_length] cannot raise the guard. Mirrors the frontend Zod max.
+        max_length = (maxlen_config || 128).to_i
+        if length > max_length
+          emsg = "Generated password length must be no more than #{max_length} characters"
+          raise_form_error emsg, field: :length
+        end
+
+        # Build character set options from merged configuration
+        char_sets = merged_options['character_sets'] || {}
+
+        secret_logger.debug 'Generating secret',
+          {
+            # extid, never custid: custid holds the email address on legacy
+            # (pre-v0.22) records, which would put PII in the payload.
+            user_id: cust&.extid,
+            length: length,
+            char_sets: char_sets.keys,
+            action: 'generate',
+          }
+
+        # Use the configurable password generation method
+        @secret_value = Onetime::Utils.strand(length, char_sets)
+      end
     end
   end
 end

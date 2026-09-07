@@ -1,0 +1,10 @@
+<%= t('email.expiration_warning.expires_in', time_remaining: time_remaining) %>.
+
+<%= t('email.expiration_warning.view_before_gone') %>
+<%= secret_uri %>
+
+<%= t('email.expiration_warning.reminder_label') %> <%= t('email.expiration_warning.after_expiration') %>
+
+<%= signature_name || t('email.expiration_warning.signature') %>
+
+<%= t('email.expiration_warning.footer_note', product_name: product_name) %>

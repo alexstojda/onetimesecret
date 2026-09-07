@@ -1,0 +1,275 @@
+# lib/onetime/jobs/workers/base_worker.rb
+#
+# frozen_string_literal: true
+
+require 'sneakers'
+require 'json'
+require_relative '../../utils/retry_helper'
+require_relative '../trace_propagation'
+
+module Onetime
+  module Jobs
+    module Workers
+      # Base module for RabbitMQ workers (using Kicks gem)
+      #
+      # Provides common functionality for all workers:
+      # - Logging via SemanticLogger (named 'Workers')
+      # - Message schema validation
+      # - Retry logic with exponential backoff
+      # - Dead letter queue handling
+      #
+      # Example:
+      #   class MyWorker
+      #     include Sneakers::Worker
+      #     include Onetime::Jobs::Workers::BaseWorker
+      #
+      #     from_queue 'my.queue', ack: true, threads: 4
+      #
+      #     def work_with_params(msg, delivery_info, metadata)
+      #       store_envelope(delivery_info, metadata)
+      #       data = parse_message(msg)
+      #       # ... do work ...
+      #       ack!
+      #     end
+      #   end
+      #
+      module BaseWorker
+        def self.included(base)
+          base.extend(ClassMethods)
+          base.include(InstanceMethods)
+        end
+
+        module ClassMethods
+          # Override to provide worker-specific configuration
+          def worker_name
+            name.split('::').last # can replace with familia refinement, config_name
+          end
+
+          # Override in workers that need boot-time validation of required
+          # configuration (credentials, env vars, etc.). Called by WorkerCommand
+          # before starting Sneakers. Default is a no-op.
+          #
+          # @raise [StandardError] if essentials are missing
+          def check_essentials!
+            # No-op by default
+          end
+        end
+
+        module InstanceMethods
+          # AMQP envelope accessors - set by work_with_params
+          # These provide access to delivery_info and metadata from the AMQP envelope
+          attr_accessor :delivery_info, :metadata
+
+          # Store AMQP envelope for access by helper methods
+          # Call this at the start of work_with_params
+          # @param delivery_info [Bunny::DeliveryInfo] AMQP delivery info
+          # @param metadata [Bunny::MessageProperties] AMQP message properties
+          def store_envelope(delivery_info, metadata)
+            @delivery_info = delivery_info
+            @metadata      = metadata
+          end
+
+          # Extract Sentry trace headers from message metadata.
+          #
+          # Returns empty hash if no trace headers present (backwards compatible
+          # with messages published before trace propagation was implemented).
+          #
+          # @return [Hash<String, String>] Trace headers or empty hash
+          def extract_trace_headers
+            Onetime::Jobs::TracePropagation.parse_trace_headers(@metadata)
+          end
+
+          # Continue Sentry trace from message headers and wrap processing.
+          #
+          # Links worker errors and performance data to the originating web
+          # request in Sentry. Creates a new transaction if trace headers are
+          # absent. Safe to call even if Sentry is not configured.
+          #
+          # @param name [String] Transaction name (default: "rabbitmq.WorkerClass")
+          # @param op [String] Span operation (default: 'queue.process')
+          # @yield Block to execute within the transaction
+          # @return Result of the block
+          def with_trace_context(name: nil, op: 'queue.process', &)
+            trace_headers    = extract_trace_headers
+            transaction_name = name || "rabbitmq.#{worker_name}"
+
+            Onetime::Jobs::TracePropagation.continue_trace(
+              trace_headers,
+              name: transaction_name,
+              op: op,
+              &
+            )
+          end
+
+          # Parse and validate message payload
+          # @param msg [String] Raw message body
+          # @return [Hash, nil] Parsed message data, or nil if invalid
+          def parse_message(msg)
+            log_debug 'Parsing message', message_id: message_id, size: msg&.bytesize
+            data = JSON.parse(msg, symbolize_names: true)
+            return nil unless validate_schema(data)
+
+            data
+          rescue JSON::ParserError => ex
+            log_error "Invalid JSON: #{ex.message}", message_id: message_id
+            flush_logs
+            reject!
+            nil
+          end
+
+          # Validate message schema version
+          # @return [Boolean] true if valid, false if invalid (also calls reject!)
+          def validate_schema(_data)
+            version = @metadata&.headers&.[]('x-schema-version') || 1
+
+            unless Onetime::Jobs::QueueConfig::Versions.const_defined?("V#{version}")
+              log_error "Unknown schema version: #{version}", message_id: message_id
+              flush_logs
+              reject!
+              return false
+            end
+
+            true
+          end
+
+          # @return [SemanticLogger::Logger] Logger for worker operations
+          def logger
+            @logger ||= Onetime.get_logger('Workers')
+          end
+
+          # Logging helpers with structured data
+          def log_info(message, **payload)
+            logger.info message, worker: worker_name, **payload
+          end
+
+          def log_debug(message, **payload)
+            logger.debug message, worker: worker_name, **payload
+          end
+
+          def log_error(message, error = nil, **payload)
+            if error
+              logger.error message,
+                worker: worker_name,
+                error: error.message,
+                error_class: error.class.name,
+                backtrace: error.backtrace&.first(5),
+                **payload
+            else
+              logger.error message, worker: worker_name, **payload
+            end
+          end
+
+          # Flush async log appender to ensure messages are written.
+          # Call before reject!/ack! when debugging missing logs.
+          def flush_logs
+            SemanticLogger.flush if defined?(SemanticLogger)
+          rescue StandardError
+            # Don't let flush failures break message processing
+          end
+
+          def worker_name
+            self.class.worker_name
+          end
+
+          # Override Kicks' verbose log_msg to produce cleaner output
+          # Original includes Thread.current (ugly) and @queue.opts (verbose)
+          def log_msg(msg)
+            "[#{@id}][#{@queue.name}] #{msg}"
+          end
+
+          # Override Kicks' worker_trace to avoid escaped JSON from msg.inspect
+          # Shows first 200 chars of payload for debugging without the noise
+          def worker_trace(msg)
+            # Skip the verbose "Working off:" messages at debug level
+            return if msg.start_with?('Working off:') && !ENV['WORKER_TRACE_PAYLOAD']
+
+            logger.debug(log_msg(msg))
+          end
+
+          # Retry logic with exponential backoff.
+          #
+          # Delegates to Onetime::Utils::RetryHelper with worker-specific logging.
+          #
+          # @param max_retries [Integer] Maximum retry attempts
+          # @param base_delay [Float] Base delay in seconds
+          # @param retriable [Proc, nil] Optional predicate to check if an error
+          #   should be retried. Receives the exception; returns true to retry,
+          #   false to re-raise immediately. Defaults to retrying all StandardError.
+          #
+          # @see Onetime::Utils::RetryHelper#with_retry
+          #
+          def with_retry(max_retries: 3, base_delay: 1.0, retriable: nil, &)
+            Onetime::Utils::RetryHelper.with_retry(
+              max_retries: max_retries,
+              base_delay: base_delay,
+              retriable: retriable,
+              logger: logger,
+              context: worker_name,
+              &
+            )
+          end
+
+          # Extract metadata from message properties
+          #
+          # NOTE: redelivered? is useful for logging/debugging but not as a
+          # substitute for idempotency checks. A message can be delivered
+          # exactly once and still be a duplicate (publisher retry before
+          # broker ack), and a redelivered message might legitimately need
+          # processing (worker crashed before your code ran). The Valkey
+          # check remains the source of truth.
+          def message_metadata
+            {
+              delivery_tag: @delivery_info&.delivery_tag,
+              routing_key: @delivery_info&.routing_key,
+              redelivered: @delivery_info&.redelivered?,
+              message_id: message_id,
+              schema_version: @metadata&.headers&.[]('x-schema-version'),
+            }
+          end
+
+          # Get message ID from AMQP properties
+          # @return [String, nil] The message_id or nil if not present
+          def message_id
+            @metadata&.message_id
+          end
+
+          # A simple predicate to be used as a read-only check only. Hot path
+          # code should use claim_for_processing. This is an idempotency check.
+          #
+          # @param msg_id [String] Message ID to check
+          # @return [Boolean] true if already processed
+          def already_processed?(msg_id)
+            return false unless msg_id
+
+            Familia.dbclient.exists?("job:processed:#{msg_id}")
+          end
+
+          # Idempotency check.
+          # Returns true if this call successfully claimed the message
+          # Returns false if already claimed by another worker
+          def claim_for_processing(msg_id)
+            return false unless msg_id
+
+            ttl = Onetime::Jobs::QueueConfig::IDEMPOTENCY_TTL
+            # Familia.dbclient.set returns true if SET NX succeeded, false if key existed
+            Familia.dbclient.set("job:processed:#{msg_id}", '1', nx: true, ex: ttl)
+          end
+
+          # Release a previously-taken idempotency claim. Call this from a
+          # failure path BEFORE reject!: without it, a DLQ replay of the same
+          # message_id within the claim TTL is silently ack'd as a duplicate
+          # no-op instead of re-running. Only safe for workers whose work is
+          # idempotent. A never-claimed msg_id is a harmless no-op delete.
+          #
+          # @param msg_id [String, nil] Message ID whose claim to release
+          # @return [Boolean] true if a claim key was deleted
+          def release_processing_claim(msg_id)
+            return false unless msg_id
+
+            Familia.dbclient.del("job:processed:#{msg_id}").positive?
+          end
+        end
+      end
+    end
+  end
+end

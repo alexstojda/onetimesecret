@@ -1,0 +1,1297 @@
+{
+  "web.organizations.title": {
+    "text": "Organizations",
+    "content_hash": "2730183d"
+  },
+  "web.organizations.organization": {
+    "text": "Workspace",
+    "content_hash": "87bb59ba"
+  },
+  "web.organizations.organization_plural": {
+    "text": "Organizations",
+    "content_hash": "2730183d"
+  },
+  "web.organizations.organizations_description": {
+    "text": "Manage your organizations",
+    "content_hash": "dbaa4f92"
+  },
+  "web.organizations.my_organizations": {
+    "text": "Workspaces",
+    "content_hash": "1377264b"
+  },
+  "web.organizations.manage_organizations": {
+    "text": "Manage Workspaces",
+    "content_hash": "cc2d65f8"
+  },
+  "web.organizations.new_organization": {
+    "text": "New Organization",
+    "content_hash": "4876e647"
+  },
+  "web.organizations.no_organizations": {
+    "text": "No workspaces yet",
+    "content_hash": "97d0b117"
+  },
+  "web.organizations.no_organizations_description": {
+    "text": "Workspaces provide unified billing and administration. Get started by creating your first workspace.",
+    "content_hash": "f09d4987"
+  },
+  "web.organizations.no_description": {
+    "text": "No description provided",
+    "content_hash": "41183d01"
+  },
+  "web.organizations.default": {
+    "text": "Default",
+    "content_hash": "21b111cb"
+  },
+  "web.organizations.create_organization": {
+    "text": "Create Organization",
+    "content_hash": "e27f4540"
+  },
+  "web.organizations.create_workspace": {
+    "text": "Create Workspace",
+    "content_hash": "c63c14cf"
+  },
+  "web.organizations.create_first_organization": {
+    "text": "Create First Workspace",
+    "content_hash": "98a583b4"
+  },
+  "web.organizations.create_organization_description": {
+    "text": "Create a new workspace",
+    "content_hash": "6ac2b5fc"
+  },
+  "web.organizations.create": {
+    "text": "Create",
+    "content_hash": "4759498a"
+  },
+  "web.organizations.create_error": {
+    "text": "Failed to create workspace",
+    "content_hash": "0a8d4fd6"
+  },
+  "web.organizations.organization_name": {
+    "text": "Workspace Name",
+    "content_hash": "6fa5a5b1"
+  },
+  "web.organizations.organization_name_placeholder": {
+    "text": "e.g. Acme Corporation",
+    "content_hash": "ac1c804b"
+  },
+  "web.organizations.display_name": {
+    "text": "Organization Name",
+    "content_hash": "4cbd9073"
+  },
+  "web.organizations.description": {
+    "text": "Description",
+    "content_hash": "526e0087"
+  },
+  "web.organizations.description_placeholder": {
+    "text": "What is this organization for?",
+    "content_hash": "27d7edae"
+  },
+  "web.organizations.contact_email": {
+    "text": "Billing Email",
+    "content_hash": "513332d3"
+  },
+  "web.organizations.contact_email_help": {
+    "text": "Primary contact for billing and administrative notifications",
+    "content_hash": "ee81c03d"
+  },
+  "web.organizations.select_organization": {
+    "text": "Select a workspace",
+    "content_hash": "70a8ce66"
+  },
+  "web.organizations.switcher_locked": {
+    "text": "Workspace switching not available on this page",
+    "content_hash": "c34114ac"
+  },
+  "web.organizations.not_found": {
+    "text": "Organization not found",
+    "content_hash": "00c50f7a"
+  },
+  "web.organizations.load_error": {
+    "text": "Failed to load organization",
+    "content_hash": "6b5fa342"
+  },
+  "web.organizations.fetch_organization_error": {
+    "text": "Failed to load organization",
+    "content_hash": "6b5fa342"
+  },
+  "web.organizations.fetch_organizations_error": {
+    "text": "Failed to load organizations",
+    "content_hash": "03b30208"
+  },
+  "web.organizations.organization_information": {
+    "text": "Organization Information",
+    "content_hash": "85274cee"
+  },
+  "web.organizations.created": {
+    "text": "Created",
+    "content_hash": "d70b9e24"
+  },
+  "web.organizations.last_updated": {
+    "text": "Last Updated",
+    "content_hash": "048c7f2e"
+  },
+  "web.organizations.organization_settings": {
+    "text": "Organization Settings",
+    "content_hash": "cc1d9e61"
+  },
+  "web.organizations.organization_settings_description": {
+    "text": "Update your organization name and description",
+    "content_hash": "2d8b5b2b"
+  },
+  "web.organizations.general_settings": {
+    "text": "General Settings",
+    "content_hash": "de322f87"
+  },
+  "web.organizations.organization_id": {
+    "text": "Organization ID",
+    "context": "Label for the read-only organization external ID shown on the organization Settings tab",
+    "content_hash": "1f466322"
+  },
+  "web.organizations.organization_id_hint": {
+    "text": "Use this ID when contacting support or scoping API requests to this organization. It is not a sign-in credential.",
+    "context": "Hint under the copyable organization ID clarifying it is a reference identifier, not a Basic auth username",
+    "content_hash": "29549b3a"
+  },
+  "web.organizations.entitlements_title": {
+    "text": "Organization Entitlements",
+    "content_hash": "36054d4f"
+  },
+  "web.organizations.billing_settings": {
+    "text": "Billing & Subscription",
+    "content_hash": "896913f0"
+  },
+  "web.organizations.save_changes": {
+    "text": "Save Changes",
+    "content_hash": "35322b5b"
+  },
+  "web.organizations.update_success": {
+    "text": "Organization updated successfully",
+    "content_hash": "af39d0f3"
+  },
+  "web.organizations.update_error": {
+    "text": "Failed to update organization",
+    "content_hash": "bc2b59b8"
+  },
+  "web.organizations.billing_email_updated": {
+    "text": "Billing email updated successfully",
+    "content_hash": "080a7f11"
+  },
+  "web.organizations.billing_email_managed_on_billing": {
+    "text": "Billing email can be changed on the Billing Overview page",
+    "content_hash": "8a131415"
+  },
+  "web.organizations.billing_coming_soon": {
+    "text": "Billing Integration Coming Soon",
+    "content_hash": "d3e0ec75"
+  },
+  "web.organizations.billing_coming_soon_description": {
+    "text": "Unified billing and subscription management will be available in a future release.",
+    "content_hash": "8836108f"
+  },
+  "web.organizations.about_title": {
+    "text": "About Organizations",
+    "content_hash": "2f3e2ad8"
+  },
+  "web.organizations.about_description": {
+    "text": "Organizations provide unified billing and administration for centralized management.",
+    "content_hash": "910f97a8"
+  },
+  "web.organizations.single_user_info_title": {
+    "text": "Manage Your Organization",
+    "content_hash": "810a6c86"
+  },
+  "web.organizations.single_user_info_description": {
+    "text": "Update your company name and organization details here. This information helps personalize your account and can be used for branding features in the future.",
+    "content_hash": "96b2e4b5"
+  },
+  "web.organizations.getting_started_title": {
+    "text": "Getting Started with Organizations",
+    "content_hash": "2871e738"
+  },
+  "web.organizations.getting_started_description": {
+    "text": "Create your first organization to manage your company information and prepare for future branding features.",
+    "content_hash": "0487f33a"
+  },
+  "web.organizations.page_description": {
+    "text": "Manage your organizations and team members",
+    "content_hash": "2d026be4"
+  },
+  "web.organizations.page_description_short": {
+    "text": "View and configure your workspaces",
+    "content_hash": "524fcb9a"
+  },
+  "web.organizations.tabs.general": {
+    "text": "Settings",
+    "content_hash": "74a883a0"
+  },
+  "web.organizations.tabs.company_branding": {
+    "text": "Company Branding",
+    "content_hash": "7ecc5d35"
+  },
+  "web.organizations.tabs.team": {
+    "text": "Team",
+    "content_hash": "5985039f"
+  },
+  "web.organizations.tabs.members": {
+    "text": "Members",
+    "content_hash": "1044a4c0"
+  },
+  "web.organizations.tabs.billing": {
+    "text": "Billing",
+    "content_hash": "3ac8bbca"
+  },
+  "web.organizations.tabs.subscription": {
+    "text": "Subscription",
+    "content_hash": "4999c6c6"
+  },
+  "web.organizations.danger_zone": {
+    "text": "Danger Zone",
+    "content_hash": "3c1c01b4"
+  },
+  "web.organizations.delete_organization": {
+    "text": "Delete Organization",
+    "content_hash": "54b2edc7"
+  },
+  "web.organizations.delete_organization_warning": {
+    "text": "This will permanently delete the organization. This action cannot be undone.",
+    "content_hash": "ab2d2c05"
+  },
+  "web.organizations.delete_organization_remove_domains_first": {
+    "text": "Remove all custom domains before deleting this organization.",
+    "content_hash": "44678715"
+  },
+  "web.organizations.delete_organization_cancel_subscription_first": {
+    "text": "Cancel this organization's subscription before deleting it.",
+    "context": "Shown under the delete organization action when the org's subscription can still bill (active, trialing, past_due or unpaid), which the server refuses to delete",
+    "content_hash": "f0c54eca"
+  },
+  "web.organizations.delete": {
+    "text": "Delete",
+    "content_hash": "e2d0a549"
+  },
+  "web.organizations.delete_organization_confirm_title": {
+    "text": "Delete Organization",
+    "content_hash": "54b2edc7"
+  },
+  "web.organizations.delete_organization_confirm_message": {
+    "text": "Are you sure you want to delete {name}? This action cannot be undone.",
+    "content_hash": "db7e1f9d"
+  },
+  "web.organizations.delete_error": {
+    "text": "Failed to delete organization",
+    "content_hash": "a8e5bb28"
+  },
+  "web.organizations.default_org_delete_notice_title": {
+    "text": "Deleting this organization",
+    "content_hash": "9191d915"
+  },
+  "web.organizations.default_org_delete_notice_before": {
+    "text": "This is your default organization and can't be removed from the dashboard. To delete it, please reach out through the",
+    "content_hash": "e203607d"
+  },
+  "web.organizations.default_org_delete_notice_link": {
+    "text": "feedback form",
+    "content_hash": "94645a9e"
+  },
+  "web.organizations.default_org_delete_notice_after": {
+    "text": ".",
+    "content_hash": "cdb4ee2a"
+  },
+  "web.organizations.leave_organization": {
+    "text": "Leave this organization",
+    "content_hash": "d534cff9"
+  },
+  "web.organizations.leave_organization_warning": {
+    "text": "You will lose access to this organization and its resources.",
+    "content_hash": "e9daab07"
+  },
+  "web.organizations.leave_organization_confirm_title": {
+    "text": "Leave Organization",
+    "content_hash": "ec8314da"
+  },
+  "web.organizations.leave_organization_confirm_message": {
+    "text": "Are you sure you want to leave {name}? You will need a new invitation to rejoin.",
+    "content_hash": "e21c5fec"
+  },
+  "web.organizations.leave_organization_success": {
+    "text": "You have left the organization.",
+    "content_hash": "fc803eb3"
+  },
+  "web.organizations.leave_error": {
+    "text": "Failed to leave organization",
+    "content_hash": "6cb6af43"
+  },
+  "web.organizations.members.title": {
+    "text": "Members",
+    "content_hash": "1044a4c0"
+  },
+  "web.organizations.members.description": {
+    "text": "Manage organization members and their roles",
+    "content_hash": "1353774c"
+  },
+  "web.organizations.members.current_members": {
+    "text": "Current Members",
+    "content_hash": "cfc156ae"
+  },
+  "web.organizations.members.member": {
+    "text": "Member",
+    "content_hash": "7c968fb7"
+  },
+  "web.organizations.members.member_singular": {
+    "text": "member",
+    "content_hash": "e31ab643"
+  },
+  "web.organizations.members.member_plural": {
+    "text": "members",
+    "content_hash": "17373ca1"
+  },
+  "web.organizations.members.member_quota": {
+    "text": "{used} of {limit} members",
+    "content_hash": "51183b79"
+  },
+  "web.organizations.members.pending_suffix": {
+    "text": "({count} pending)",
+    "content_hash": "c13f787f"
+  },
+  "web.organizations.members.limit_reached_hint": {
+    "text": "Member limit reached.",
+    "content_hash": "26cdb6b8"
+  },
+  "web.organizations.members.name": {
+    "text": "Name",
+    "content_hash": "dcd1d522"
+  },
+  "web.organizations.members.email": {
+    "text": "Email",
+    "content_hash": "969ccbd3"
+  },
+  "web.organizations.members.role": {
+    "text": "Role",
+    "content_hash": "14736a2e"
+  },
+  "web.organizations.members.joined": {
+    "text": "Joined",
+    "content_hash": "69318b0c"
+  },
+  "web.organizations.members.actions": {
+    "text": "Actions",
+    "content_hash": "ff8059dc"
+  },
+  "web.organizations.members.no_members": {
+    "text": "No members yet. Invite team members to get started.",
+    "content_hash": "6cbc5271"
+  },
+  "web.organizations.members.no_members_description": {
+    "text": "This organization has no members yet.",
+    "content_hash": "61dd2085"
+  },
+  "web.organizations.members.role_updated": {
+    "text": "Member role updated successfully",
+    "content_hash": "d0d332c6"
+  },
+  "web.organizations.members.role_update_error": {
+    "text": "Failed to update member role",
+    "content_hash": "17d5ca66"
+  },
+  "web.organizations.members.member_removed": {
+    "text": "Member removed from organization",
+    "content_hash": "210a187b"
+  },
+  "web.organizations.members.member_remove_error": {
+    "text": "Failed to remove member",
+    "content_hash": "1cff79b7"
+  },
+  "web.organizations.members.remove_member_title": {
+    "text": "Remove Member",
+    "content_hash": "2b98b194"
+  },
+  "web.organizations.members.remove_member_confirm": {
+    "text": "Are you sure you want to remove {name} from this organization?",
+    "content_hash": "36695d98"
+  },
+  "web.organizations.members.cannot_change_own_role": {
+    "text": "You cannot change your own role",
+    "content_hash": "0d874f75"
+  },
+  "web.organizations.members.cannot_remove_self": {
+    "text": "You cannot remove yourself from the organization",
+    "content_hash": "ab358307"
+  },
+  "web.organizations.members.cannot_remove_owner": {
+    "text": "You cannot remove the organization owner",
+    "content_hash": "c92ed0f4"
+  },
+  "web.organizations.members.insufficient_permissions": {
+    "text": "You do not have permission to manage members",
+    "content_hash": "d6239f33"
+  },
+  "web.organizations.members.roles.owner": {
+    "text": "Owner",
+    "content_hash": "4b1b8aa3"
+  },
+  "web.organizations.members.roles.admin": {
+    "text": "Admin",
+    "content_hash": "c1c224b0"
+  },
+  "web.organizations.members.roles.member": {
+    "text": "Member",
+    "content_hash": "7c968fb7"
+  },
+  "web.organizations.members.role_descriptions.owner": {
+    "text": "Full access to all organization settings and members",
+    "content_hash": "d49381bf"
+  },
+  "web.organizations.members.role_descriptions.admin": {
+    "text": "Can manage members and most organization settings",
+    "content_hash": "3d7ade92"
+  },
+  "web.organizations.members.role_descriptions.member": {
+    "text": "Basic access to organization resources",
+    "content_hash": "0ddca91a"
+  },
+  "web.organizations.invitations.title": {
+    "text": "Organization Invitations",
+    "content_hash": "0289d92d"
+  },
+  "web.organizations.invitations.invite_member": {
+    "text": "Invite Member",
+    "content_hash": "8e8a0b88"
+  },
+  "web.organizations.invitations.invite_new_member": {
+    "text": "Invite New Member",
+    "content_hash": "0bfb50ed"
+  },
+  "web.organizations.invitations.pending_invitations": {
+    "text": "Pending Invitations",
+    "content_hash": "b327e8a8"
+  },
+  "web.organizations.invitations.no_pending_invitations": {
+    "text": "No pending invitations",
+    "content_hash": "275814da"
+  },
+  "web.organizations.invitations.email_address": {
+    "text": "Email Address",
+    "content_hash": "09bf25ef"
+  },
+  "web.organizations.invitations.email_placeholder": {
+    "text": "member{'@'}example.com",
+    "content_hash": "7fd425f7"
+  },
+  "web.organizations.invitations.role": {
+    "text": "Role",
+    "content_hash": "14736a2e"
+  },
+  "web.organizations.invitations.send_invite": {
+    "text": "Send Invitation",
+    "content_hash": "d076aa0f"
+  },
+  "web.organizations.invitations.invite_sent": {
+    "text": "Invitation sent successfully",
+    "content_hash": "81facbe6"
+  },
+  "web.organizations.invitations.invite_error": {
+    "text": "Failed to send invitation",
+    "content_hash": "cedbf507"
+  },
+  "web.organizations.invitations.resend": {
+    "text": "Resend",
+    "content_hash": "1f948437"
+  },
+  "web.organizations.invitations.revoke": {
+    "text": "Revoke",
+    "content_hash": "87e6d00b"
+  },
+  "web.organizations.invitations.resend_success": {
+    "text": "Invitation resent successfully",
+    "content_hash": "099eb255"
+  },
+  "web.organizations.invitations.resend_error": {
+    "text": "Failed to resend invitation",
+    "content_hash": "82750487"
+  },
+  "web.organizations.invitations.revoke_success": {
+    "text": "Invitation revoked successfully",
+    "content_hash": "4ce1262c"
+  },
+  "web.organizations.invitations.revoke_error": {
+    "text": "Failed to revoke invitation",
+    "content_hash": "9dbd2a60"
+  },
+  "web.organizations.invitations.invited_by": {
+    "text": "Invited by",
+    "content_hash": "c7a6f156"
+  },
+  "web.organizations.invitations.invited_by_inline": {
+    "text": "by {email}",
+    "context": "Inline attribution shown below org name in invitation context box",
+    "content_hash": "969a7050"
+  },
+  "web.organizations.invitations.invited_as_inline": {
+    "text": "as a {role}",
+    "context": "Inline role shown below inviter in invitation context box, reads as part of a sentence",
+    "content_hash": "ff9e9b18"
+  },
+  "web.organizations.invitations.invited_at": {
+    "text": "Invited",
+    "content_hash": "63b17bec"
+  },
+  "web.organizations.invitations.expires_at": {
+    "text": "Expires",
+    "content_hash": "f6725f3a"
+  },
+  "web.organizations.invitations.resent_count": {
+    "text": "Resent {count} time",
+    "content_hash": "e71d1c6d"
+  },
+  "web.organizations.invitations.resent_count_plural": {
+    "text": "Resent {count} times",
+    "content_hash": "e58d803d"
+  },
+  "web.organizations.invitations.status.pending": {
+    "text": "Pending",
+    "content_hash": "331551b0"
+  },
+  "web.organizations.invitations.status.accepted": {
+    "text": "Accepted",
+    "content_hash": "a00fb0c5"
+  },
+  "web.organizations.invitations.status.declined": {
+    "text": "Declined",
+    "content_hash": "dce083a2"
+  },
+  "web.organizations.invitations.status.expired": {
+    "text": "Expired",
+    "content_hash": "424a2551"
+  },
+  "web.organizations.invitations.status.revoked": {
+    "text": "Revoked",
+    "content_hash": "f6f738d0"
+  },
+  "web.organizations.invitations.roles.member": {
+    "text": "Team Member",
+    "content_hash": "d4e55dfa"
+  },
+  "web.organizations.invitations.roles.admin": {
+    "text": "Admin",
+    "content_hash": "c1c224b0"
+  },
+  "web.organizations.invitations.accept_invitation": {
+    "text": "Accept Invitation",
+    "content_hash": "ce7cfeaf"
+  },
+  "web.organizations.invitations.decline_invitation": {
+    "text": "Decline Invitation",
+    "content_hash": "f6e06ada"
+  },
+  "web.organizations.invitations.invitation_details": {
+    "text": "Invitation Details",
+    "content_hash": "59936259"
+  },
+  "web.organizations.invitations.you_are_invited": {
+    "text": "You've been invited to join",
+    "content_hash": "60e635c6"
+  },
+  "web.organizations.invitations.invited_as": {
+    "text": "You've been invited as a",
+    "content_hash": "f9809eae"
+  },
+  "web.organizations.invitations.accept_success": {
+    "text": "Invitation accepted successfully",
+    "content_hash": "7eb6b234"
+  },
+  "web.organizations.invitations.accept_error": {
+    "text": "Failed to accept invitation",
+    "content_hash": "3ecc8b0f"
+  },
+  "web.organizations.invitations.decline_success": {
+    "text": "Invitation declined",
+    "content_hash": "31bffdcb"
+  },
+  "web.organizations.invitations.decline_error": {
+    "text": "Failed to decline invitation",
+    "content_hash": "2bccbd56"
+  },
+  "web.organizations.invitations.expired_message": {
+    "text": "This invitation has expired",
+    "content_hash": "b72770d7"
+  },
+  "web.organizations.invitations.invalid_token": {
+    "text": "Invalid or expired invitation",
+    "content_hash": "6c0fc3de"
+  },
+  "web.organizations.invitations.back_to_home": {
+    "text": "Back to home",
+    "context": "Link text on invalid/expired invitation page",
+    "content_hash": "76c5505f"
+  },
+  "web.organizations.invitations.must_sign_in": {
+    "text": "Please sign in to accept this invitation",
+    "content_hash": "469fc705"
+  },
+  "web.organizations.invitations.loading_invitation": {
+    "text": "Loading invitation details",
+    "content_hash": "58884885"
+  },
+  "web.organizations.invitations.upgrade_to_invite": {
+    "text": "Upgrade your plan to invite team members",
+    "content_hash": "5e3f8df8"
+  },
+  "web.organizations.invitations.upgrade_prompt": {
+    "text": "Member invites require a paid plan. Upgrade to add collaborators to your organization.",
+    "content_hash": "47d0eeab"
+  },
+  "web.organizations.paid_badge": {
+    "text": "Pro",
+    "content_hash": "957b0b87"
+  },
+  "web.organizations.early_supporter_badge": {
+    "text": "Early Supporter",
+    "content_hash": "e67d2ef8"
+  },
+  "web.organizations.member_count": {
+    "text": "{count} member | {count} members",
+    "content_hash": "f652af0c"
+  },
+  "web.organizations.domain_count": {
+    "text": "{count} domain | {count} domains",
+    "content_hash": "09f52efa"
+  },
+  "web.organizations.tabs.domains": {
+    "text": "Domains",
+    "content_hash": "ced67718"
+  },
+  "web.organizations.tabs.sso": {
+    "text": "SSO",
+    "content_hash": "5ba3ac9f"
+  },
+  "web.organizations.tabs.activity": {
+    "text": "Activity",
+    "content_hash": "38da1505"
+  },
+  "web.organizations.audit.title": {
+    "text": "Secret Activity",
+    "content_hash": "6d6d41f3"
+  },
+  "web.organizations.audit.description": {
+    "text": "Audit trail of secret creation and access events recorded for this organization.",
+    "content_hash": "553c564b"
+  },
+  "web.organizations.audit.columns.event": {
+    "text": "Event",
+    "content_hash": "4e1f49a9"
+  },
+  "web.organizations.audit.columns.secret": {
+    "text": "Secret",
+    "content_hash": "7e32a729"
+  },
+  "web.organizations.audit.columns.actor": {
+    "text": "Actor",
+    "content_hash": "449995c4"
+  },
+  "web.organizations.audit.columns.country": {
+    "text": "Country",
+    "content_hash": "701d021d"
+  },
+  "web.organizations.audit.columns.when": {
+    "text": "When",
+    "content_hash": "cf9c7aa2"
+  },
+  "web.organizations.audit.country_unknown": {
+    "text": "Unknown",
+    "content_hash": "b764cdc0"
+  },
+  "web.organizations.audit.kinds.created": {
+    "text": "Secret created",
+    "content_hash": "e4a1e1fd"
+  },
+  "web.organizations.audit.kinds.status_get": {
+    "text": "Link status checked",
+    "content_hash": "0753f60e"
+  },
+  "web.organizations.audit.kinds.secret_get": {
+    "text": "Secret link opened",
+    "content_hash": "e271e060"
+  },
+  "web.organizations.audit.kinds.previewed": {
+    "text": "Previewed by creator",
+    "content_hash": "639fc1e2"
+  },
+  "web.organizations.audit.kinds.creator_status_get": {
+    "text": "Status checked by creator",
+    "content_hash": "7e4b5de5"
+  },
+  "web.organizations.audit.kinds.receipt_viewed": {
+    "text": "Receipt viewed",
+    "content_hash": "a417ead4"
+  },
+  "web.organizations.audit.kinds.revealed": {
+    "text": "Secret revealed",
+    "content_hash": "aff2c84d"
+  },
+  "web.organizations.audit.kinds.burned": {
+    "text": "Secret burned",
+    "content_hash": "5ac68dc6"
+  },
+  "web.organizations.audit.kinds.expired": {
+    "text": "Secret expired",
+    "content_hash": "c127dab6"
+  },
+  "web.organizations.audit.kinds.orphaned": {
+    "text": "Secret orphaned",
+    "content_hash": "23fe1a47"
+  },
+  "web.organizations.audit.kinds.reveal_failed_undecryptable": {
+    "text": "Reveal failed (undecryptable)",
+    "content_hash": "d5616abf"
+  },
+  "web.organizations.audit.actors.creator": {
+    "text": "Creator",
+    "content_hash": "88447b83"
+  },
+  "web.organizations.audit.actors.authenticated_other": {
+    "text": "Another signed-in user",
+    "content_hash": "ee45aa5a"
+  },
+  "web.organizations.audit.actors.anonymous": {
+    "text": "Anonymous",
+    "content_hash": "e7a8aa2d"
+  },
+  "web.organizations.audit.actors.system": {
+    "text": "System",
+    "content_hash": "6725e7bb"
+  },
+  "web.organizations.audit.actors.unknown": {
+    "text": "Unknown",
+    "content_hash": "b764cdc0"
+  },
+  "web.organizations.audit.empty_title": {
+    "text": "No activity yet",
+    "content_hash": "0a12b92c"
+  },
+  "web.organizations.audit.empty_description": {
+    "text": "Secret creation and access events will appear here as your team shares secrets.",
+    "content_hash": "62fb14c2"
+  },
+  "web.organizations.audit.capped_notice": {
+    "text": "Only the newest {max} events are retained; older activity has been trimmed.",
+    "content_hash": "da7901e2"
+  },
+  "web.organizations.audit.collection_paused_notice": {
+    "text": "Event collection is paused; new secret activity is not being recorded.",
+    "content_hash": "cb09d147"
+  },
+  "web.organizations.audit.load_error": {
+    "text": "Unable to load secret activity.",
+    "content_hash": "52fde814"
+  },
+  "web.organizations.audit.contract_mismatch": {
+    "text": "The activity data returned by the server could not be read. The trail is not empty — it just cannot be displayed right now.",
+    "content_hash": "db0d007a"
+  },
+  "web.organizations.audit.retry": {
+    "text": "Try again",
+    "content_hash": "d8b8392e"
+  },
+  "web.organizations.audit.showing_range": {
+    "text": "Showing {from}–{to} of {total}",
+    "content_hash": "c329279d"
+  },
+  "web.organizations.audit.upgrade_prompt": {
+    "text": "Secret activity requires a plan with audit logs. Upgrade to see who created, viewed, and revealed secrets in this organization.",
+    "content_hash": "453649ce"
+  },
+  "web.organizations.audit.role_required": {
+    "text": "Secret activity is available to organization owners and admins.",
+    "content_hash": "e066ec63"
+  },
+  "web.organizations.sso.title": {
+    "text": "Single Sign-On (SSO)",
+    "content_hash": "5db5c812"
+  },
+  "web.organizations.sso.description": {
+    "text": "Configure SSO to allow members to sign in with your organization's identity provider",
+    "content_hash": "464f0a8b"
+  },
+  "web.organizations.sso.provider_type": {
+    "text": "Provider Type",
+    "content_hash": "bdfbb1ec"
+  },
+  "web.organizations.sso.provider_type_description": {
+    "text": "Select your organization's identity provider",
+    "content_hash": "e81325a6"
+  },
+  "web.organizations.sso.display_name": {
+    "text": "Display Name",
+    "content_hash": "18d67c99"
+  },
+  "web.organizations.sso.display_name_hint": {
+    "text": "A friendly name shown to users when signing in",
+    "content_hash": "a83f1fba"
+  },
+  "web.organizations.sso.display_name_placeholder": {
+    "text": "e.g. Acme Corp SSO",
+    "content_hash": "43c655c5"
+  },
+  "web.organizations.sso.client_id": {
+    "text": "Client ID",
+    "content_hash": "8726db01"
+  },
+  "web.organizations.sso.client_id_placeholder": {
+    "text": "Your OAuth client ID",
+    "content_hash": "830723da"
+  },
+  "web.organizations.sso.client_secret": {
+    "text": "Client Secret",
+    "content_hash": "ae21cf6d"
+  },
+  "web.organizations.sso.client_secret_placeholder": {
+    "text": "Your OAuth client secret",
+    "content_hash": "14e4a8c8"
+  },
+  "web.organizations.sso.client_secret_update_hint": {
+    "text": "Leave blank to keep the existing secret",
+    "content_hash": "98bc3b40"
+  },
+  "web.organizations.sso.tenant_id": {
+    "text": "Tenant ID",
+    "content_hash": "de1f5fff"
+  },
+  "web.organizations.sso.tenant_id_hint": {
+    "text": "Your Azure AD / Entra ID tenant identifier",
+    "content_hash": "3c5b707a"
+  },
+  "web.organizations.sso.tenant_id_placeholder": {
+    "text": "e.g. 12345678-1234-1234-1234-123456789abc",
+    "content_hash": "1a166316"
+  },
+  "web.organizations.sso.issuer": {
+    "text": "Issuer URL",
+    "content_hash": "4d03ba8a"
+  },
+  "web.organizations.sso.issuer_hint": {
+    "text": "The OIDC discovery URL for your identity provider",
+    "content_hash": "6102d81b"
+  },
+  "web.organizations.sso.issuer_placeholder": {
+    "text": "e.g. https://login.example.com",
+    "content_hash": "9a638e9c"
+  },
+  "web.organizations.sso.view_discovery_document": {
+    "text": "View discovery document",
+    "content_hash": "513bda60"
+  },
+  "web.organizations.sso.callback_url": {
+    "text": "Callback URL",
+    "content_hash": "dc297ae9"
+  },
+  "web.organizations.sso.callback_url_hint": {
+    "text": "Add this URL to your identity provider's allowed redirect URIs",
+    "content_hash": "65d55683"
+  },
+  "web.organizations.sso.allowed_domains": {
+    "text": "Allowed Email Domains",
+    "content_hash": "0295ad71"
+  },
+  "web.organizations.sso.allowed_domains_hint": {
+    "text": "Only users with email addresses from these domains can sign in. Leave empty to allow all domains.",
+    "content_hash": "1775e874"
+  },
+  "web.organizations.sso.domain_placeholder": {
+    "text": "e.g. acme.com",
+    "content_hash": "e4420764"
+  },
+  "web.organizations.sso.invalid_domain": {
+    "text": "Please enter a valid domain (e.g. example.com)",
+    "content_hash": "16807983"
+  },
+  "web.organizations.sso.domain_exists": {
+    "text": "This domain is already in the list",
+    "content_hash": "3fccb721"
+  },
+  "web.organizations.sso.remove_domain": {
+    "text": "Remove {domain}",
+    "content_hash": "ae708a1d"
+  },
+  "web.organizations.sso.connection_enabled": {
+    "text": "Connection active",
+    "content_hash": "b6334b2b"
+  },
+  "web.organizations.sso.connection_enabled_hint": {
+    "text": "When active, members can sign in with this SSO provider. SSO must also be enabled as a sign-in method in the domain's Sign-In Configuration.",
+    "content_hash": "871db2f1"
+  },
+  "web.organizations.sso.enable_untested_warning": {
+    "text": "This connection has not passed a test here yet. Run Test connection before turning it on, so a broken setup never reaches your sign-in page.",
+    "context": "Advisory warning beside the Connection active toggle when it is switched on without a successful connection test in the current editing session. Not a hard block.",
+    "content_hash": "c1fbdeca"
+  },
+  "web.organizations.sso.enforce_sso_only": {
+    "text": "Enforce SSO only",
+    "content_hash": "b3a3f694"
+  },
+  "web.organizations.sso.enforce_sso_only_hint": {
+    "text": "Require SSO for all sign-ins on this domain. When enabled, password-based authentication is disabled.",
+    "content_hash": "19432210"
+  },
+  "web.organizations.sso.grant_org_scope": {
+    "text": "Grant org-wide access",
+    "content_hash": "2070cef2"
+  },
+  "web.organizations.sso.grant_org_scope_hint": {
+    "text": "New members who join via this domain's SSO will be granted access to all organization domains. Existing members are unaffected. When disabled (default), new members can only access this domain.",
+    "content_hash": "2ac9f345"
+  },
+  "web.organizations.sso.save_config": {
+    "text": "Save SSO Configuration",
+    "content_hash": "70853769"
+  },
+  "web.organizations.sso.delete_config": {
+    "text": "Delete Configuration",
+    "content_hash": "9ac1ac7b"
+  },
+  "web.organizations.sso.delete_confirm": {
+    "text": "Are you sure? This will disable SSO for your organization.",
+    "content_hash": "5b3f5b9d"
+  },
+  "web.organizations.sso.load_error": {
+    "text": "Failed to load SSO configuration",
+    "content_hash": "75cb73f6"
+  },
+  "web.organizations.sso.save_error": {
+    "text": "Failed to save SSO configuration",
+    "content_hash": "99ef145b"
+  },
+  "web.organizations.sso.create_success": {
+    "text": "SSO configuration created successfully",
+    "content_hash": "531c7d92"
+  },
+  "web.organizations.sso.update_success": {
+    "text": "SSO configuration updated successfully",
+    "content_hash": "d98d8e83"
+  },
+  "web.organizations.sso.delete_success": {
+    "text": "SSO configuration deleted successfully",
+    "content_hash": "55f5d4f5"
+  },
+  "web.organizations.sso.delete_error": {
+    "text": "Failed to delete SSO configuration",
+    "content_hash": "4a960fe4"
+  },
+  "web.organizations.sso.test_connection": {
+    "text": "Test Connection",
+    "content_hash": "c02977b0"
+  },
+  "web.organizations.sso.test_connection_hint": {
+    "text": "Verify the identity provider is reachable (does not validate credentials)",
+    "content_hash": "22a23b68"
+  },
+  "web.organizations.sso.test_button": {
+    "text": "Test Connection",
+    "content_hash": "c02977b0"
+  },
+  "web.organizations.sso.testing": {
+    "text": "Testing...",
+    "content_hash": "6c02a284"
+  },
+  "web.organizations.sso.test_error": {
+    "text": "Failed to test connection",
+    "content_hash": "c1d1f310"
+  },
+  "web.organizations.sso.auth_endpoint": {
+    "text": "Authorization Endpoint",
+    "content_hash": "b42b956f"
+  },
+  "web.organizations.sso.missing_fields": {
+    "text": "Missing Fields",
+    "content_hash": "757df777"
+  },
+  "web.organizations.sso.status_enabled": {
+    "text": "Enabled",
+    "content_hash": "92c1cdfd"
+  },
+  "web.organizations.sso.status_configured": {
+    "text": "Configured",
+    "content_hash": "84aebc69"
+  },
+  "web.organizations.sso.domain_sso_title": {
+    "text": "Domain SSO",
+    "content_hash": "13161464"
+  },
+  "web.organizations.sso.domain_sso_description": {
+    "text": "Configure SSO for each verified domain",
+    "content_hash": "af5b799e"
+  },
+  "web.organizations.sso.provider_type_locked_hint": {
+    "text": "To change provider, delete this configuration first",
+    "content_hash": "0a1027ff"
+  },
+  "web.organizations.sso.status_not_configured": {
+    "text": "Not Configured",
+    "content_hash": "bbea960e"
+  },
+  "web.organizations.sso.no_domains": {
+    "text": "No verified domains",
+    "content_hash": "8a7fbb76"
+  },
+  "web.organizations.sso.no_domains_description": {
+    "text": "Add and verify a domain before configuring SSO for it.",
+    "content_hash": "e825d13a"
+  },
+  "web.organizations.invitations.email_mismatch_title": {
+    "text": "Different account signed in",
+    "content_hash": "6516362a"
+  },
+  "web.organizations.invitations.email_mismatch_body": {
+    "text": "This invitation is for {invitedEmail}. You're currently signed in as {currentEmail}.",
+    "content_hash": "78a6f301"
+  },
+  "web.organizations.invitations.continue_as_invited_email": {
+    "text": "Continue as {email}",
+    "content_hash": "ccf9745d"
+  },
+  "web.organizations.invitations.expires_in_days": {
+    "text": "{days}d left",
+    "content_hash": "50ff6f2b"
+  },
+  "web.organizations.invitations.expires_in_hours": {
+    "text": "{hours}h left",
+    "content_hash": "ff56d105"
+  },
+  "web.organizations.invitations.expires_soon": {
+    "text": "Expires soon",
+    "content_hash": "a5dcfef9"
+  },
+  "web.organizations.invitations.email_locked_hint": {
+    "text": "This invitation was sent to this email address",
+    "context": "Hint text explaining why email field is readonly",
+    "content_hash": "2cff7075"
+  },
+  "web.organizations.invitations.signup_continue": {
+    "text": "Continue",
+    "context": "Submit button on the invite signup form. Submits the form and creates the account; the user then confirms the join on the next screen.",
+    "content_hash": "31fbef16"
+  },
+  "web.organizations.invitations.signin_continue": {
+    "text": "Sign In",
+    "context": "Submit button on the invite signin form. Signs the user in; the user then confirms the join on the next screen.",
+    "content_hash": "bcc0bcc9"
+  },
+  "web.organizations.invitations.confirm_join_below": {
+    "text": "Almost done — confirm below to join the organization.",
+    "context": "Success message shown after the user completes signup or signin from an invite link. The Decline/Accept buttons appear immediately below.",
+    "content_hash": "2d14f9b0"
+  },
+  "web.organizations.invitations.go_to_organizations": {
+    "text": "Go to Organizations",
+    "context": "Button text for navigating to organizations page",
+    "content_hash": "2afa38a3"
+  },
+  "web.organizations.invitations.already_member": {
+    "text": "You are already a member of this organization",
+    "context": "Message shown when invitation was already accepted",
+    "content_hash": "f56ad547"
+  },
+  "web.organizations.invitations.restricted_host_title": {
+    "text": "A different sign-in method is required here",
+    "context": "Heading on the invitation page when this site restricts sign-in to a single method that is not a password, so the password signup form is not offered.",
+    "content_hash": "d761ad30"
+  },
+  "web.organizations.invitations.restricted_host_body": {
+    "text": "This site only allows signing in with {method}, so an account cannot be created here with a password. {method} is not something you can complete on this page.",
+    "context": "Explanation shown when the site restricts sign-in to a method the invitation page cannot complete. {method} is a method name such as Email authentication or Passkeys.",
+    "content_hash": "6ac146d4"
+  },
+  "web.organizations.invitations.restricted_host_unknown_body": {
+    "text": "This site only allows one specific sign-in method, and it is not one this page can offer. An account cannot be created here with a password.",
+    "context": "Explanation shown when the site restricts sign-in to a method this version of the app does not recognise, so it cannot be named.",
+    "content_hash": "e24d59a9"
+  },
+  "web.organizations.invitations.restricted_sso_body": {
+    "text": "This site uses single sign-on. Sign in with your organization's provider to continue — that creates your account and signs you in.",
+    "context": "Explanation shown on the invitation page when the site restricts sign-in to SSO, before the button that starts the SSO flow.",
+    "content_hash": "e942d04b"
+  },
+  "web.organizations.invitations.restricted_sso_cta": {
+    "text": "Continue to sign in",
+    "context": "Button that sends the invitee to the sign-in page to authenticate with single sign-on, returning to the invitation afterwards.",
+    "content_hash": "d398cd0a"
+  },
+  "web.organizations.invitations.restricted_use_email_link": {
+    "text": "Open the link in your invitation email to accept from the main site instead.",
+    "context": "Fallback guidance pointing the invitee back to the original invitation email link when the current site cannot complete sign-in.",
+    "content_hash": "73bf298f"
+  },
+  "web.organizations.invitations.invitation_stays_pending": {
+    "text": "Your invitation is still valid — nothing has been used up, and you can accept it once you have signed in.",
+    "context": "Reassurance shown alongside a sign-in restriction notice, so the invitee does not think their invitation link has been spent or lost.",
+    "content_hash": "f4d00be1"
+  },
+  "web.organizations.invitations.signin_unavailable_title": {
+    "text": "Sign-in is not available on this site",
+    "context": "Heading on the invitation page when the site's sign-in restriction cannot be honored, so no sign-in method works here.",
+    "content_hash": "c56bce2b"
+  },
+  "web.organizations.invitations.signin_unavailable_body": {
+    "text": "This site is restricted to {method}, which is not working here, so there is no way to sign in at the moment.",
+    "context": "Shown when the site restricts sign-in to a method that cannot run, leaving no way to sign in. {method} is a method name such as Single Sign-On.",
+    "content_hash": "62c01601"
+  },
+  "web.organizations.invitations.signin_unavailable_unknown_body": {
+    "text": "This site is restricted to a sign-in method that is not working here, so there is no way to sign in at the moment.",
+    "context": "Shown when the site's sign-in restriction cannot be honored and the method cannot be named by this version of the app.",
+    "content_hash": "1f61e456"
+  },
+  "web.organizations.invitations.signin_unavailable_conflict_body": {
+    "text": "This site's sign-in settings conflict with the site-wide restriction ({method}), so neither applies and there is no way to sign in at the moment.",
+    "context": "Shown when a domain's sign-in restriction and the site-wide restriction name different methods, so neither can apply. {method} is the site-wide method name.",
+    "content_hash": "54cdfd61"
+  },
+  "web.organizations.invitations.join_organization": {
+    "text": "Join {orgName}",
+    "context": "Dynamic page title for signup flow",
+    "content_hash": "1aea9194"
+  },
+  "web.organizations.invitations.sign_in_to_join": {
+    "text": "Sign in to join {orgName}",
+    "context": "Dynamic page title for signin flow",
+    "content_hash": "f94ed8b4"
+  },
+  "web.organizations.invitations.decline": {
+    "text": "Decline",
+    "context": "Button text for declining an invitation inline",
+    "content_hash": "a2d285b3"
+  },
+  "api.organizations.errors.not_found": {
+    "text": "Organization not found: %{extid}",
+    "context": "Returned when an organization extid lookup fails",
+    "content_hash": "c8d058eb"
+  },
+  "api.organizations.errors.owner_required": {
+    "text": "Only organization owner can perform this action",
+    "context": "Returned when an action requires owner role",
+    "content_hash": "5a729e94"
+  },
+  "api.organizations.errors.admin_required": {
+    "text": "Only organization owners and admins can perform this action",
+    "context": "Generic default when admin/owner role is required",
+    "content_hash": "cd9e8c0e"
+  },
+  "api.organizations.errors.member_required": {
+    "text": "You must be an organization member to perform this action",
+    "context": "Returned when an action requires any organization role",
+    "content_hash": "f66f4a60"
+  },
+  "api.organizations.invitations.errors.create_admin_required": {
+    "text": "Only organization owners and admins can create invitations",
+    "context": "Returned when a non-admin tries to create an invitation",
+    "content_hash": "777d150d"
+  },
+  "api.organizations.invitations.errors.resend_admin_required": {
+    "text": "Only organization owners and admins can resend invitations",
+    "context": "Returned when a non-admin tries to resend an invitation",
+    "content_hash": "6a857d59"
+  },
+  "api.organizations.invitations.errors.view_admin_required": {
+    "text": "Only organization owners and admins can view invitations",
+    "context": "Returned when a non-admin tries to list invitations",
+    "content_hash": "42f5878b"
+  },
+  "api.organizations.invitations.errors.revoke_admin_required": {
+    "text": "Only organization owners and admins can revoke invitations",
+    "context": "Returned when a non-admin tries to revoke an invitation",
+    "content_hash": "52f73c8a"
+  },
+  "api.organizations.invitations.errors.email_required": {
+    "text": "Email is required",
+    "context": "Returned when invitation create is missing the email field",
+    "content_hash": "aae92911"
+  },
+  "api.organizations.invitations.errors.email_invalid": {
+    "text": "Invalid email format",
+    "context": "Returned when invitation create has a malformed email",
+    "content_hash": "0bcecf66"
+  },
+  "api.organizations.invitations.errors.role_invalid": {
+    "text": "Role must be member or admin",
+    "context": "Returned when invitation specifies an unsupported role",
+    "content_hash": "650ea5f6"
+  },
+  "api.organizations.invitations.errors.cannot_invite_owner": {
+    "text": "Cannot invite as owner",
+    "context": "Returned when invitation specifies owner role (owners assigned directly)",
+    "content_hash": "e6581025"
+  },
+  "api.organizations.invitations.errors.already_member": {
+    "text": "User is already a member of this organization",
+    "context": "Returned when inviting a user who is already in the org",
+    "content_hash": "8eb45780"
+  },
+  "api.organizations.invitations.errors.already_pending": {
+    "text": "Invitation already pending for this email",
+    "context": "Returned when a duplicate invitation is attempted",
+    "content_hash": "7f5e3093"
+  },
+  "api.organizations.invitations.errors.member_limit_reached": {
+    "text": "Member limit reached. Upgrade your plan to invite more members.",
+    "context": "Returned when org members_per_org quota is hit",
+    "content_hash": "b8f316e8"
+  },
+  "api.organizations.invitations.errors.not_found": {
+    "text": "Invitation not found",
+    "context": "Returned when a token does not match a known invitation",
+    "content_hash": "775ba9eb"
+  },
+  "api.organizations.invitations.errors.cannot_resend_non_pending": {
+    "text": "Can only resend pending invitations",
+    "context": "Returned when resending an accepted/declined/expired invitation",
+    "content_hash": "b7578b3e"
+  },
+  "api.organizations.invitations.errors.cannot_revoke_non_pending": {
+    "text": "Can only revoke pending invitations",
+    "context": "Returned when revoking an accepted/declined/expired invitation",
+    "content_hash": "732b78a6"
+  },
+  "api.organizations.invitations.errors.resend_limit_reached": {
+    "text": "Maximum resend limit (%{max}) reached",
+    "context": "Returned when invitation resend_count reaches MAX_RESENDS",
+    "content_hash": "8dc96729"
+  },
+  "api.organizations.invitations.errors.accept_token_required": {
+    "text": "Token is required",
+    "context": "Returned when accept invite missing token",
+    "content_hash": "6c718161"
+  },
+  "api.organizations.invitations.errors.accept_organization_gone": {
+    "text": "Organization no longer exists",
+    "context": "Returned when the invitation's org was deleted",
+    "content_hash": "a5df7d22"
+  },
+  "api.organizations.invitations.errors.accept_expired": {
+    "text": "Invitation has expired",
+    "context": "Returned when the invitation has expired",
+    "content_hash": "7186297b"
+  },
+  "api.organizations.invitations.errors.accept_email_mismatch": {
+    "text": "Your email address does not match the invitation",
+    "context": "Returned when accepting user's email differs from invitation email",
+    "content_hash": "11026f46"
+  },
+  "api.organizations.invitations.errors.accept_already_member": {
+    "text": "You are already a member of this organization",
+    "context": "Returned when accept invite by user who is already a member",
+    "content_hash": "f56ad547"
+  },
+  "web.organizations.organizations": {
+    "text": "Organizations",
+    "content_hash": "2730183d"
+  },
+  "web.organizations.sso.enabled": {
+    "text": "Enable SSO",
+    "content_hash": "d10d0801"
+  },
+  "web.organizations.sso.enabled_hint": {
+    "text": "When enabled, organization members can sign in using this SSO provider",
+    "content_hash": "d7da2fa2"
+  }
+}

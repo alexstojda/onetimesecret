@@ -1,202 +1,504 @@
 # lib/onetime/mail/views/base.rb
+#
+# frozen_string_literal: true
 
-require 'chimera'
-require_relative 'view_helpers'
+require 'erb'
+require 'yaml'
 
 module Onetime
   module Mail
-    module Views
-
-      class Base < Chimera
-        include Mail::ViewHelpers
-
-        self.template_path = './templates/mail'
-        self.view_namespace = Onetime::Mail
-        self.view_path = './onetime/email'
-
-        attr_reader :cust, :locale, :emailer, :mode, :from, :to
-        attr_accessor :token, :text_template
-
-        def initialize cust, locale, *args
-          @cust = cust
-          @locale = locale
-
-          # We quietly continue if we're given an unknown locale and continue
-          # with the default. This avoids erroring out when sending an email
-          # for example which we don't have a proper UX to handle letting the
-          # user know that the email was not sent yet (and then having a way
-          # to retry sending the email).
-          if OT.locales.key?(locale)
-            OT.li "Initializing #{self.class} with locale: #{locale.to_s}"
-          else
-            default_value = OT.default_locale
-            @locale = default_value
-            available = OT.supported_locales
-            OT.le "[views.i18n] Locale not found: #{locale} (continuing with #{default_value} / #{available})"
+    module Templates
+      # DEPRECATED: EmailTranslations class
+      #
+      # This class has been replaced by the ruby-i18n gem. It's kept for
+      # backward compatibility during the migration but will be removed.
+      #
+      # Use I18n.t() directly instead:
+      #   I18n.t('email.organization_invitation.subject', locale: 'en')
+      #
+      class EmailTranslations
+        class << self
+          # Delegate to I18n.t() for translation lookups
+          #
+          # @param key [String] Translation key
+          # @param locale [String] Locale code
+          # @param options [Hash] Interpolation options
+          # @return [String] Translated string
+          #
+          def translate(key, locale: 'en', **)
+            I18n.t(key, locale: locale.to_sym, **)
           end
 
-          OT.ld "#{self.class} locale is: #{locale.to_s}"
-
-          conf = OT.conf.fetch(:emailer, {})
-
-          @mode = conf.fetch(:mode, 'smtp').to_s.to_sym
-
-          # Create a new instance of the configured mailer class for this request
-          @emailer = OT.emailer.new(
-            conf.fetch(:from, nil),
-            conf.fetch(:fromname, nil),
-            cust&.email, # use for the reply-to field
-          )
-
-          password_is_present = conf.fetch(:pass, nil).to_s.length.positive?
-          logsafe_config = {
-            from: conf.fetch(:from, nil),
-            fromname: conf.fetch(:fromname, nil),
-            host: conf.fetch(:host, nil),
-            port: conf.fetch(:port, nil),
-            user: conf.fetch(:user, nil),
-            tls: conf.fetch(:tls, nil),
-            auth: conf.fetch(:auth, nil), # auth type
-            region: conf.fetch(:region, nil),
-            pass: "has password: #{password_is_present}",
-            locale: locale.to_s,
-          }
-
-          OT.info "[mailer] #{mode} #{logsafe_config.to_json}"
-          init(*args) if respond_to? :init
-        end
-
-        # Retrieves internationalization data for the current view context.
-        #
-        # This method implements locale-aware caching:
-        #   1. Each locale has its own cache entry to prevent cross-locale contamination
-        #   2. The first request for a locale builds and stores the i18n data
-        #   3. Subsequent requests for the same locale use the cached data
-        #
-        # Also handles the following cases:
-        #   - If this instance doesn't have a locale yet, we'll use the default locale.
-        #   - If the configured default_locale data is missing, returns english data
-        #
-        # @note TESTING CONSIDERATIONS:
-        #   Without per-locale caching, tests can fail intermittently due to:
-        #   - Test order dependency: If a test with valid locale runs first, the method
-        #     memoizes valid data and subsequent tests pass regardless of locale validity
-        #   - If a test with invalid locale runs first, the method fails and doesn't cache
-        #     data, causing inconsistent behavior
-        #   - RSpec's randomized execution order means these failures appear intermittent
-        #
-        # @return [Hash] Structured hash containing locale-specific content:
-        #   - :locale [String] The resolved locale code
-        #   - :email [Hash] Email template content for the current page
-        #   - :COMMON [Hash] Common web text elements
-        #
-        def i18n
-          @i18n_cache ||= {}
-          locale = self.locale #|| OT.default_locale || 'en'
-
-          # Return cached value for this specific locale if it exists
-          return @i18n_cache[locale] if @i18n_cache.key?(locale)
-
-          # Safely get locale data with fallback
-          locale_data = OT.locales[locale] || OT.locales['en']
-
-          pagename = self.class.name.split('::').last.downcase.to_sym
-          {
-            locale: locale,
-            email: locale_data[:email][pagename],
-            COMMON: locale_data[:web][:COMMON],
-          }
-        end
-
-        def deliver_email token=nil
-          errmsg = "Your message wasn't sent because we have an email problem"
-
-          email_address_obscured = OT::Utils.obscure_email self[:email_address]
-          OT.info "Emailing/#{self.token} #{email_address_obscured} [#{self.class}]"
-
-          message_identifier = if self[:secret]
-                      self[:secret].identifier
-                    else
-                      SecureRandom.hex.to_s[0, 24]
-                    end
-
-          mailer_response = begin
-            # If we have a token of gratitude, we skip the email. There is only one
-            # codepath that has a token set. Just keep in mind that this is not an
-            # authentication token or any kind of unique value. It's just a simple
-            # flag that when set to any truthy value will skip over this delivery.
-            # See V1::API#create
-            unless token
-              emailer.send_email self[:email_address], subject, render_html, render_text
-            end
-
-          rescue SocketError => ex
-          internal_emsg = "Cannot send mail: #{ex.message}\n#{ex.backtrace}"
-            OT.le internal_emsg
-
-            V2::EmailReceipt.create self[:cust].identifier, message_identifier, internal_emsg
-            raise OT::Problem, errmsg
-
-          rescue Exception => ex
-            internal_emsg = "Cannot send mail: #{ex.message}\n#{ex.backtrace}"
-            OT.le internal_emsg
-            OT.le errmsg
-
-            V2::EmailReceipt.create self[:cust].identifier, message_identifier, internal_emsg.to_json
-            raise OT::Problem, errmsg
+          # No-op for backward compatibility
+          def reset!
+            # I18n doesn't need manual cache clearing
           end
-
-          # Nothing left to do here if we didn't send an email
-          return unless mailer_response
-
-          V2::EmailReceipt.create self[:cust].identifier, message_identifier, mailer_response.to_json
-
-          OT.info "[email-sent] to #{email_address_obscured} #{self[:cust].identifier} #{message_identifier}"
-          mailer_response
         end
-
-        def render_html
-          render
-        end
-
-        def render_text
-          clone = self.clone
-          # Create a new options hash if none exists, or duplicate the existing one
-          opts = clone.instance_variable_get(:@options)
-          opts = opts ? opts.dup : {}
-          # Set template extension
-          opts[:template_extension] = 'txt'
-          # Update the options in the cloned instance
-          clone.instance_variable_set(:@options, opts)
-          clone.render
-        end
-
-        def receipt_uri(obj)
-          format('/receipt/%s', obj.key)
-        end
-        alias private_uri receipt_uri
-        def secret_uri(obj)
-          format('/secret/%s', obj.key)
-        end
-
-        def secret_display_domain(obj)
-          scheme = base_scheme
-          host = obj.share_domain || Onetime.conf[:site][:host]
-          [scheme, host].join
-        end
-
-        def base_scheme
-          Onetime.conf[:site][:ssl] ? 'https://' : 'http://'
-        end
-
-        def baseuri
-          scheme = base_scheme
-          host = Onetime.conf[:site][:host]
-          [scheme, host].join
-        end
-
       end
 
+      # Base class for email templates using ERB.
+      #
+      # Subclasses define template-specific data and subject lines.
+      # Templates are loaded from lib/onetime/mail/templates/ directory.
+      #
+      # Design notes for future ruby-i18n integration:
+      # - Template data is passed as a hash, not instance variables
+      # - Subject lines are defined as methods that can call I18n.t()
+      # - Template files can use <%= t('key') %> when i18n is added
+      # - The `t` helper method is already stubbed for future use
+      #
+      # Example usage:
+      #   template = SecretLink.new(
+      #     secret: secret,
+      #     recipient: "user@example.com",
+      #     sender_email: "sender@example.com",
+      #     locale: 'en'
+      #   )
+      #   template.render_text  # => rendered text content
+      #   template.render_html  # => rendered HTML content
+      #   template.subject      # => email subject line
+      #
+      class Base
+        TEMPLATE_PATH = File.expand_path('../templates', __dir__)
+
+        # Whether render_text wraps the body in the shared text layout
+        # (layout.txt.erb, which appends the product footer plus the
+        # conditional support line). Defaults to true. A subclass opts out at
+        # its own definition site with `text_layout false`, so the rationale
+        # for opting out travels with the declaration. See #3362.
+        @text_layout = true
+
+        class << self
+          # Declarative per-template switch for the shared text layout. Call in
+          # a subclass body: `text_layout false`.
+          def text_layout(enabled)
+            @text_layout = enabled
+          end
+
+          # Whether this template wraps its text body in the shared layout.
+          # `!= false` so subclasses that never declare (nil) default to on.
+          def text_layout?
+            @text_layout != false
+          end
+        end
+
+        attr_reader :data, :locale
+
+        # @param data [Hash] Template variables
+        # @param locale [String] Locale code (default: 'en')
+        def initialize(data = {}, locale: 'en')
+          @data   = data
+          @locale = locale
+          validate_data!
+        end
+
+        # Email subject line - override in subclasses
+        # @return [String]
+        def subject
+          raise NotImplementedError, "#{self.class} must implement #subject"
+        end
+
+        # Render the text template, wrapped in the shared text layout.
+        #
+        # Mirrors render_html: the per-template file provides only the body
+        # content; layout.txt.erb supplies the consolidated footer (product
+        # name, base URI) plus the conditional BRAND_SUPPORT_EMAIL line so the
+        # plaintext/multipart-fallback path carries the support contact too.
+        # Before #3362 render_text used no layout, so the support contact was
+        # wired into the HTML footer only and omitted from plaintext.
+        #
+        # Templates that opt out (`text_layout false`) keep their own footer
+        # and are returned unwrapped. wrap_in_layout guards on File.exist?, so a
+        # missing layout.txt.erb yields unwrapped content rather than raising;
+        # the rescue below only covers subclasses with no .txt.erb at all.
+        #
+        # @return [String, nil] nil if the subclass has no .txt.erb template
+        def render_text
+          content = render_template('txt')
+          return content unless self.class.text_layout?
+
+          wrap_in_layout(content, 'txt')
+        rescue Errno::ENOENT
+          # No .txt.erb for this subclass (html-only mailer); mirrors render_html.
+          nil
+        end
+
+        # Render the HTML template, wrapped in the shared layout.
+        #
+        # The per-template file (e.g. secret_link.html.erb) provides only the
+        # body content; layout.html.erb supplies the shared shell, branded
+        # header, and footer so every email shares one design system.
+        #
+        # @return [String, nil] nil if no HTML template exists
+        def render_html
+          content = render_template('html')
+          wrap_in_layout(content, 'html')
+        rescue Errno::ENOENT
+          # HTML template is optional
+          nil
+        end
+
+        # Build complete email hash ready for delivery
+        # @param from [String] Sender email address
+        # @param reply_to [String, nil] Reply-to address
+        # @return [Hash]
+        def to_email(from:, reply_to: nil)
+          {
+            to: recipient_email,
+            from: from,
+            reply_to: reply_to,
+            subject: subject,
+            text_body: render_text,
+            html_body: render_html,
+          }
+        end
+
+        protected
+
+        # Override in subclasses to validate required data
+        def validate_data!
+          # Base implementation does nothing
+        end
+
+        # Template name derived from class name
+        # SecretLink -> secret_link
+        # @return [String]
+        def template_name
+          self.class.name
+            .split('::').last
+            .gsub(/([A-Z]+)([A-Z][a-z])/, '\1_\2')
+            .gsub(/([a-z\d])([A-Z])/, '\1_\2')
+            .downcase
+        end
+
+        # Get the recipient email from data
+        # Override in subclasses if recipient is stored differently
+        # @return [String]
+        def recipient_email
+          data[:recipient] || data[:email_address] || data[:to]
+        end
+
+        # URL scheme ('https://' unless site.ssl is explicitly false). Shared
+        # by site_baseuri and brand_baseuri so both agree on http/https.
+        # @return [String]
+        def scheme
+          site_ssl? ? 'https://' : 'http://'
+        end
+
+        # Site SSL configuration helper
+        # @return [Boolean]
+        def site_ssl?
+          return true unless defined?(OT) && OT.respond_to?(:conf)
+
+          OT.conf.dig('site', 'ssl') != false
+        end
+
+        # Site host configuration helper
+        # @return [String]
+        def site_host
+          return 'localhost' unless defined?(OT) && OT.respond_to?(:conf)
+
+          OT.conf.dig('site', 'host') || 'localhost'
+        end
+
+        # Site base URI configuration helper
+        # @return [String]
+        def site_baseuri
+          "#{scheme}#{site_host}"
+        end
+
+        # Full base URI for the domain this message concerns: the custom
+        # share_domain when the message carries one, otherwise the
+        # (overridable) canonical base URI. Delegates to
+        # TemplateContext#brand_baseuri — the same helper templates render
+        # with — so Ruby-side callers (e.g. ExpirationWarning#secret_uri)
+        # cannot drift from what the rendered output links to.
+        # @return [String]
+        def brand_baseuri
+          TemplateContext.new(data, locale).brand_baseuri
+        end
+
+        # Install-wide product name for mail copy. brand.product_name is the
+        # single authority (#3612); unconfigured installs fall through to the
+        # neutral NEUTRAL_PRODUCT_NAME — never nil, since templates interpolate
+        # the name into subjects and headers, and never an OTS-branded literal.
+        def site_product_name
+          OT.conf.dig('brand', 'product_name') ||
+            Onetime::CustomDomain::BrandSettingsConstants::NEUTRAL_PRODUCT_NAME
+        end
+
+        # Product name with fallback to site config
+        # @return [String]
+        def product_name
+          data[:product_name] || site_product_name
+        end
+
+        # Bare host label naming the domain this message is about. Used by
+        # account/system emails (password_request, magic_link, ...) in
+        # subjects and i18n interpolations; data-driven with a canonical-host
+        # fallback. Not a link: URLs are built from brand_baseuri, which
+        # derives from share_domain rather than display_domain.
+        # @return [String]
+        def display_domain
+          data[:display_domain] || site_host
+        end
+
+        private
+
+        def render_template(extension)
+          template_file    = File.join(TEMPLATE_PATH, "#{template_name}.#{extension}.erb")
+          template_content = File.read(template_file)
+
+          # Create a binding with access to data and helpers
+          erb = ERB.new(template_content, trim_mode: '-')
+          erb.result(template_binding)
+        end
+
+        # Wrap rendered body content in the shared layout template.
+        #
+        # The layout only needs the generic helpers (product_name, baseuri,
+        # show_logo?, t), so it renders against the raw data hash plus the
+        # injected +content+ string. If no layout exists for the extension,
+        # the content is returned unwrapped.
+        #
+        # @param content [String] Rendered body content
+        # @param extension [String] Template extension (e.g. 'html')
+        # @return [String]
+        def wrap_in_layout(content, extension)
+          layout_file = File.join(TEMPLATE_PATH, "layout.#{extension}.erb")
+          return content unless File.exist?(layout_file)
+
+          layout_content = File.read(layout_file)
+          erb            = ERB.new(layout_content, trim_mode: '-')
+          erb.result(layout_binding(content))
+        end
+
+        # Binding for the layout: raw data plus the injected body content.
+        def layout_binding(content)
+          TemplateContext.new(data.merge(content: content), locale).get_binding
+        end
+
+        # Create a binding for ERB template rendering
+        # This provides access to data hash and helper methods
+        def template_binding
+          # Make data keys available as local-ish methods via method_missing
+          TemplateContext.new(data, locale).get_binding
+        end
+
+        # Helper class to provide clean binding for ERB templates
+        class TemplateContext
+          def initialize(data, locale)
+            @data   = data
+            @locale = locale
+          end
+
+          def get_binding
+            binding
+          end
+
+          # Access data values like methods: <%= secret_uri %>
+          def method_missing(name, *args)
+            if @data.key?(name)
+              @data[name]
+            elsif @data.key?(name.to_s)
+              @data[name.to_s]
+            else
+              super
+            end
+          end
+
+          def respond_to_missing?(name, include_private = false)
+            @data.key?(name) || @data.key?(name.to_s) || super
+          end
+
+          # Translation helper for email templates
+          # Loads translations from config/locales/email/*.yml
+          # @param key [String] Translation key (e.g., 'email.organization_invitation.subject')
+          # @param options [Hash] Interpolation options
+          # @return [String] Translated string
+          def t(key, **)
+            EmailTranslations.translate(key, locale: @locale, **)
+          end
+
+          # HTML escape helper
+          # @param text [String]
+          # @return [String]
+          def h(text)
+            ERB::Util.html_escape(text)
+          end
+
+          # URL encode helper
+          # @param text [String]
+          # @return [String]
+          def u(text)
+            ERB::Util.url_encode(text)
+          end
+
+          # Site base URI helper
+          # @return [String]
+          def baseuri
+            @data[:baseuri] || site_baseuri
+          end
+
+          # Product name helper (organization name or default)
+          # @return [String]
+          def product_name
+            @data[:product_name] || site_product_name
+          end
+
+          # Bare host label naming the domain this message is about. Prefers
+          # an explicit per-message display_domain (account/system emails
+          # inject it for subjects and body copy; feedback_email reports the
+          # domain feedback was submitted from), then falls back to
+          # brand_host so domain-bound messages label the domain they
+          # concern. Not a link: templates build URLs from brand_baseuri.
+          # @return [String]
+          def display_domain
+            @data[:display_domain] || brand_host
+          end
+
+          # Host the shared layout header/footer links to and displays. Prefers
+          # the custom domain the message concerns (share_domain, set on the
+          # secret_link and incoming_secret emails) so the wordmark and footer
+          # match the domain the recipient is actually visiting; falls back to
+          # the canonical site host for account/system emails that carry no
+          # domain. This is intentionally distinct from baseuri, which body
+          # templates use to build links to install-level app paths (invite
+          # acceptance, account settings, support) that live on the canonical
+          # host regardless of the sharing domain.
+          # @return [String]
+          def brand_host
+            host = @data[:share_domain].to_s
+            host.empty? ? site_host : host
+          end
+
+          # Base URI (scheme + host) for the shared layout header/footer. When
+          # the message concerns a custom share_domain, links to that domain;
+          # otherwise defers to baseuri, preserving both the @data[:baseuri]
+          # override and the canonical site fallback for account/system emails.
+          # @return [String]
+          def brand_baseuri
+            host = @data[:share_domain].to_s
+            return "#{scheme}#{host}" unless host.empty?
+
+            baseuri
+          end
+
+          # Brand color helper - resolves from per-message data, brand config, or
+          # the neutral default (#3B82F6) defined in BrandSettingsConstants.
+          # @return [String] Hex color string
+          def brand_color
+            @brand_color ||= @data[:brand_color] ||
+                             conf_dig('brand', 'primary_color') ||
+                             Onetime::CustomDomain::BrandSettingsConstants::DEFAULTS[:primary_color]
+          end
+
+          # Support email helper - resolves from brand config or GLOBAL_DEFAULTS.
+          # GLOBAL_DEFAULTS[:support_email] is nil per #3049 — operators must
+          # set BRAND_SUPPORT_EMAIL to populate.
+          # @return [String, nil]
+          def support_email
+            @support_email ||= conf_dig('brand', 'support_email') ||
+                               Onetime::CustomDomain::BrandSettingsConstants::GLOBAL_DEFAULTS[:support_email]
+          end
+
+          # Email sign-off name. Resolves the configurable signature
+          # independently of product_name so operators can sign mail with a
+          # person or team without renaming the product everywhere else.
+          #
+          # Resolution order (highest priority first):
+          #   1. @data[:signature_name] — optional per-message override.
+          #   2. brand.signature_name (BRAND_SIGNATURE_NAME) — install-wide.
+          #
+          # Returns nil when unconfigured so templates fall back to the neutral
+          # i18n default (email.*.signature, "Support Team") rather than a
+          # hardcoded person's name. See docs/architecture/branding.md.
+          # @return [String, nil]
+          def signature_name
+            return @signature_name if defined?(@signature_name)
+
+            @signature_name = @data[:signature_name] ||
+                              conf_dig('brand', 'signature_name')
+          end
+
+          # Logo alt text helper - operator-supplied brand.logo_alt
+          # (BRAND_LOGO_ALT) when set, otherwise the install-level product
+          # name. Deliberately site_product_name, not product_name: the image
+          # this alt describes is always the install-wide brand.logo_url, so
+          # a per-message data[:product_name] (e.g. a tenant name) must not
+          # label the operator's logo — the same wrong-accessible-name rule
+          # the frontend applies to installLogoAlt.
+          # @return [String]
+          def logo_alt
+            conf_dig('brand', 'logo_alt') || site_product_name
+          end
+
+          # Logo URL helper - resolves from brand config; nil when no brand
+          # logo is configured. Per #3049 the develop default of
+          # "#{baseuri}/img/onetime-logo-v3-xl.svg" has been neutralized so
+          # shipped/private-label instances don't leak OTS branding. Templates
+          # check truthiness and render a text-only header when nil.
+          #
+          # Only absolute http(s) URLs are emitted: mail clients cannot
+          # resolve relative paths or component references, and with the
+          # legacy LOGO_URL now feeding brand.logo_url as a fallback (#3612),
+          # a masthead-oriented relative path (e.g. /img/logo.png) must not
+          # break email rendering — such values degrade to the text-only
+          # header instead.
+          # @return [String, nil]
+          def logo_url
+            return @logo_url if defined?(@logo_url)
+
+            candidate = conf_dig('brand', 'logo_url') ||
+                        Onetime::CustomDomain::BrandSettingsConstants::GLOBAL_DEFAULTS[:logo_url]
+            @logo_url = candidate.to_s.match?(%r{\Ahttps?://}i) ? candidate : nil
+          end
+
+          # Mirrors Templates::Base#site_product_name: brand.product_name is
+          # the single authority (#3612), with the neutral NEUTRAL_PRODUCT_NAME
+          # terminal so layout copy never interpolates nil.
+          def site_product_name
+            @site_product_name ||=
+              conf_dig('brand', 'product_name') ||
+              Onetime::CustomDomain::BrandSettingsConstants::NEUTRAL_PRODUCT_NAME
+          end
+
+          # Get host from site config
+          def site_host
+            @site_host ||= conf_dig('site', 'host') || 'localhost'
+          end
+
+          # Get base URI from site config
+          def site_baseuri
+            @site_baseuri ||= "#{scheme}#{site_host}"
+          end
+
+          # Operator opt-in gate for rendering a logo <img> in mail at all.
+          # Templates require show_logo? AND a usable logo_url — an absolute
+          # brand.logo_url still renders text-only when emailer.show_logo is
+          # unset/false. The two gates are independent by design: show_logo?
+          # is the "do I trust images in mail clients" switch, logo_url is
+          # the asset (nil when unset or not absolute http(s)).
+          def show_logo?
+            conf_dig('emailer', 'show_logo') == true
+          end
+
+          private
+
+          # URL scheme ('https://' unless site.ssl is explicitly false). Shared
+          # by site_baseuri and brand_baseuri so both agree on http/https.
+          # @return [String]
+          def scheme
+            conf_dig('site', 'ssl') == false ? 'http://' : 'https://'
+          end
+
+          def conf_dig(*keys)
+            return nil unless defined?(OT) && OT.respond_to?(:conf) && OT.conf
+
+            OT.conf.dig(*keys)
+          end
+        end
+      end
     end
   end
 end

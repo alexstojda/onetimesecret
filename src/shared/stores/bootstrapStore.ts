@@ -1,0 +1,456 @@
+// src/shared/stores/bootstrapStore.ts
+
+import {
+  bootstrapSchema,
+  type ApiGuestRoutes,
+  type ApiInterface,
+  type BootstrapPayload,
+  type FooterLinksConfig,
+  type HeaderConfig,
+  type LegalLinks,
+  type UiCapabilities,
+} from '@/schemas/contracts/bootstrap';
+import {
+  clearBootstrapSnapshotKey,
+  getBootstrapSnapshot,
+  updateBootstrapSnapshot,
+} from '@/services/bootstrap.service';
+import { setDiagnosticsActorContext } from '@/services/diagnostics.service';
+import { defineStore } from 'pinia';
+
+/**
+ * Default values for logged-out / initial state.
+ *
+ * Derived from bootstrapSchema.parse({}) - the schema is the single source
+ * of truth for default values. This ensures consistency between:
+ * - Server-side Rhales validation
+ * - Client-side TypeScript types
+ * - Store defaults
+ *
+ * When the user logs out, the store resets to these values.
+ */
+/**
+ * Parse schema with empty input to get base defaults.
+ * Note: Zod's .optional() fields are not included in the output if undefined.
+ */
+const SCHEMA_DEFAULTS = bootstrapSchema.parse({});
+
+/**
+ * Complete DEFAULTS with all optional fields explicitly set to undefined.
+ * This ensures Pinia's reactive state tracks all properties from the start,
+ * allowing later updates to trigger reactivity correctly.
+ */
+const DEFAULTS: BootstrapPayload = {
+  ...SCHEMA_DEFAULTS,
+  // Explicitly include optional fields that Zod omits (fields marked .optional()
+  // in the schema, not fields with .default() which are included in SCHEMA_DEFAULTS)
+  apitoken: undefined,
+  customer_since: undefined,
+  regions: undefined,
+  stripe_customer: undefined,
+  stripe_subscriptions: undefined,
+  entitlement_preview_planid: undefined,
+  entitlement_preview_plan_name: undefined,
+  organization: undefined,
+  // Pseudonymous reference for the diagnostics boundary — the opaque `user.id`
+  // Sentry groups a person's errors by. It is not an analytics identifier:
+  // nothing counts it, and it exists so a defect report can be attributed to
+  // one session without an email, customer id or IP.
+  //
+  // `.optional()` in the schema because the server OMITS it for anonymous
+  // sessions, so Zod's parse({}) leaves it out of SCHEMA_DEFAULTS and Pinia
+  // would not track it. Listed here so that later update()/resetForLogout()
+  // writes are reactive AND so that $reset() has a defined target to restore
+  // it to.
+  //
+  // Deliberately TOP-LEVEL, not nested under the `diagnostics` config block:
+  // resetForLogout() preserves `diagnostics` across logout by design, so a
+  // reference parked there would survive sign-out. At top level, $reset()
+  // clears it.
+  diagnostics_ref: undefined,
+  // Brand fields (per-installation defaults from OT.conf['brand'])
+  brand_primary_color: undefined,
+  brand_product_name: undefined,
+  brand_product_domain: undefined,
+  brand_support_email: undefined,
+  brand_corner_style: undefined,
+  brand_font_family: undefined,
+  brand_button_text_light: undefined,
+  brand_logo_url: undefined,
+  brand_logo_dark_url: undefined,
+  brand_logo_alt: undefined,
+  brand_favicon_url: undefined,
+};
+
+/**
+ * Filters out undefined values from an object.
+ * Used to ensure updates only overwrite fields with defined values,
+ * matching the previous updateIfDefined() behavior.
+ */
+function filterDefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
+  const result: Partial<T> = {};
+  for (const key of Object.keys(obj) as Array<keyof T>) {
+    if (obj[key] !== undefined) {
+      result[key] = obj[key];
+    }
+  }
+  return result;
+}
+
+/**
+ * Store state type extending BootstrapPayload with internal tracking.
+ */
+interface BootstrapState extends BootstrapPayload {
+  _initialized: boolean;
+}
+
+interface BootstrapUpdateOptions {
+  // A /bootstrap/me response is complete: absence of diagnostics_ref means the
+  // server reports an anonymous session. Local state patches are not complete.
+  source?: 'bootstrap';
+}
+
+/**
+ * Bootstrap Store - Centralized Server State
+ *
+ * This store replaces the WindowService dual-state pattern with a single
+ * Pinia store that holds all server-injected configuration and user state.
+ *
+ * Design decisions:
+ * 1. Options API with $patch() for efficient bulk updates
+ *    - Hydration uses $patch() instead of individual ref updates
+ *    - Reset preserves server config fields automatically
+ *
+ *    Note on $reset(): The built-in $reset() method only works automatically
+ *    with Options Stores. For Setup Stores, you must implement $reset manually
+ *    (typically via a plugin or custom action) because Pinia cannot infer the
+ *    initial state from a function's returned refs. This is a genuine advantage
+ *    of Options Stores for teams prioritizing state reset functionality.
+ *
+ * 2. Schema-derived defaults for logged-out state
+ *    - Store is always in a valid state
+ *    - $reset() restores initial DEFAULTS (does NOT preserve server config)
+ *    - resetForLogout() resets user state while preserving server config
+ *
+ * 3. Single source of truth
+ *    - No more window.__BOOTSTRAP_ME__ vs reactiveState synchronization
+ *    - All access goes through this store after initialization
+ *
+ * Lifecycle:
+ * - init() called once during app bootstrap (after Pinia is installed)
+ * - update() called after /bootstrap/me API responses
+ * - refresh() fetches fresh state from server (use after mutations)
+ * - resetForLogout() called on logout to restore defaults (preserving server config)
+ *
+ * Access Patterns:
+ * Options API stores auto-unwrap refs, so access patterns differ by context:
+ *
+ * 1. Direct store access (routes, composables, non-reactive JS):
+ *    ```ts
+ *    const store = useBootstrapStore();
+ *    if (store.billing_enabled) { ... }  // No .value needed
+ *    ```
+ *
+ * 2. Reactive destructuring (Vue components needing reactivity):
+ *    ```ts
+ *    const { billing_enabled } = storeToRefs(store);
+ *    if (billing_enabled.value) { ... }  // .value required
+ *    ```
+ *
+ * 3. Template usage (either pattern works without .value):
+ *    ```vue
+ *    <div v-if="store.billing_enabled">  // Direct access
+ *    <div v-if="billing_enabled">        // After storeToRefs destructure
+ *    ```
+ */
+export const useBootstrapStore = defineStore('bootstrap', {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE - Single object spreading schema defaults
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // structuredClone, not a shallow spread: DEFAULTS contains nested objects
+  // (e.g. ui.header) and a shallow copy would share those references across
+  // every store instance, letting one instance's $patch bleed into the next
+  // (notably across createTestingPinia instances in tests).
+  state: (): BootstrapState => ({
+    ...structuredClone(DEFAULTS),
+    _initialized: false,
+  }),
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GETTERS - Computed properties for derived state
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  getters: {
+    /**
+     * Whether the store has been initialized from bootstrap data.
+     */
+    isInitialized: (state): boolean => state._initialized,
+
+    /**
+     * Header configuration from UI settings.
+     * Provides typed access to header config with fallback.
+     */
+    headerConfig: (state): HeaderConfig | undefined => state.ui.header,
+
+    /**
+     * Footer links configuration from UI settings.
+     * Provides typed access to footer config with fallback.
+     */
+    footerLinksConfig: (state): FooterLinksConfig | undefined => state.ui.footer_links,
+
+    /**
+     * Legal & policy URLs from site.legal (#4278). Sibling to
+     * footerLinksConfig. Each field is null when not configured; consumers
+     * hide the corresponding link entirely rather than render a dead anchor.
+     */
+    legalUrls: (state): LegalLinks => state.legal,
+
+    /**
+     * UI capability flags controlling optional form-field visibility.
+     * Each flag is undefined when unset; consumers treat undefined as enabled.
+     */
+    uiCapabilities: (state): UiCapabilities | undefined => state.ui.capabilities,
+
+    /**
+     * API configuration from bootstrap payload.
+     * Contains enabled flag and guest route permissions.
+     */
+    apiConfig: (state): ApiInterface => state.api,
+
+    /**
+     * Guest route permissions for API access.
+     * Controls which API routes are available to unauthenticated users.
+     */
+    guestRoutes: (state): ApiGuestRoutes => state.api.guest_routes,
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ACTIONS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  actions: {
+    /**
+     * Initializes the store from bootstrap snapshot.
+     * Called once during app initialization after Pinia is installed.
+     *
+     * @returns Object with initialization status
+     */
+    init(): { isInitialized: boolean } {
+      if (this._initialized) {
+        console.debug('[BootstrapStore.init] Already initialized, skipping');
+        return { isInitialized: true };
+      }
+
+      try {
+        const snapshot = getBootstrapSnapshot();
+
+        if (!snapshot) {
+          console.debug('[BootstrapStore.init] No bootstrap data available, using defaults');
+          this._initialized = true;
+          return { isInitialized: true };
+        }
+
+        // Hydrate all state from snapshot using functional $patch
+        // (functional form avoids _DeepPartial type issues with complex Stripe types)
+        // Filter out undefined values to match previous updateIfDefined behavior
+        this.$patch((state) => {
+          Object.assign(state, filterDefined(snapshot));
+          state._initialized = true;
+        });
+
+        console.debug('[BootstrapStore.init] Initialized from snapshot:', {
+          authenticated: this.authenticated,
+          locale: this.locale,
+          email: this.email,
+        });
+      } catch (error) {
+        // Fallback to defaults if snapshot parsing or hydration fails
+        console.error(
+          '[BootstrapStore.init] Failed to initialize from snapshot, using defaults:',
+          error
+        );
+        this._initialized = true;
+      }
+
+      return { isInitialized: true };
+    },
+
+    /**
+     * Merges a partial state update into the store.
+     *
+     * A `source: 'bootstrap'` update is a complete /bootstrap/me response, so
+     * an omitted diagnostics_ref authoritatively clears actor context. Local
+     * patches are incomplete; omission leaves the existing context unchanged.
+     *
+     * @param data - Partial BootstrapPayload data to merge
+     * @param options - Whether data came from /bootstrap/me or a local patch
+     */
+    update(data: Partial<BootstrapPayload>, options: BootstrapUpdateOptions = {}): void {
+      // has_password: null means the server couldn't determine it (transient
+      // auth-DB failure during serialization). Treat it like an absent field
+      // so a blipped refresh never clobbers a known-good true/false. init()
+      // intentionally skips this drop: on first load there is no prior value
+      // to preserve, and consumers (hasPasswordOf) gate on === true, so a
+      // null in state already reads conservatively as "no password known".
+      if (data.has_password === null) {
+        const { has_password: _unknown, ...known } = data;
+        data = known;
+      }
+
+      // Use functional $patch to avoid _DeepPartial type issues with complex Stripe types
+      // Filter out undefined values to match previous updateIfDefined behavior
+      this.$patch((state) => {
+        Object.assign(state, filterDefined(data));
+      });
+
+      // Keep the bootstrap.service snapshot in sync so non-Pinia readers
+      // (features.ts hasPassword/isSsoOnlyMode used by route guards and the
+      // settings sidebar) see fresh values after login or other auth mutations.
+      updateBootstrapSnapshot(data);
+
+      // ─── Sentry user context ──────────────────────────────────────────────
+      //
+      // This is the ACCOUNT-CHANGE hook. Every account transition funnels
+      // through update(): login, MFA completion, and the 15-minute
+      // /bootstrap/me refresh (which can report a different account after a
+      // re-auth in another tab). Logout is handled separately in
+      // authStore.logout(), which does not route through here.
+      //
+      // Absence is the anonymous signal, and the filterDefined() merge above
+      // CANNOT express it: an absent `diagnostics_ref` key leaves the previous
+      // reference in state and in the snapshot. So absence is handled
+      // explicitly here.
+      //
+      // A /bootstrap/me response is complete, so an absent diagnostics_ref is
+      // authoritative ("this session has no ref"). Auth state alone cannot
+      // identify that response: setAuthenticated() also emits a local patch
+      // containing authenticated after its refresh completes. For local
+      // patches, silence about diagnostics_ref means "unchanged".
+      const isBootstrapResponse = options.source === 'bootstrap';
+      if (isBootstrapResponse || data.diagnostics_ref !== undefined) {
+        const nextRef = data.diagnostics_ref;
+        if (nextRef === undefined) {
+          this.$patch((state) => {
+            state.diagnostics_ref = undefined;
+          });
+          clearBootstrapSnapshotKey('diagnostics_ref');
+        }
+        // setDiagnosticsActorContext validates the block against the strict
+        // contract and clears the context on null/undefined. It no-ops when
+        // diagnostics are disabled, so this call is unconditional by design.
+        setDiagnosticsActorContext(nextRef ?? null);
+      }
+
+      console.debug('[BootstrapStore.update] Updated with:', {
+        authenticated: data.authenticated,
+        awaiting_mfa: data.awaiting_mfa,
+        fieldsUpdated: Object.keys(data).length,
+      });
+    },
+
+    /**
+     * Refreshes state from the /bootstrap/me API endpoint.
+     * Use this to sync state with the server after actions that change server state.
+     *
+     * @returns Promise that resolves when state is refreshed
+     * @throws Error if fetch fails
+     */
+    async refresh(): Promise<void> {
+      if (typeof window === 'undefined') {
+        throw new Error('[BootstrapStore] Cannot refresh: window is not defined');
+      }
+
+      const response = await fetch('/bootstrap/me', {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`[BootstrapStore] Failed to refresh state: ${response.status}`);
+      }
+
+      const newState = (await response.json()) as BootstrapPayload;
+      this.update(newState, { source: 'bootstrap' });
+    },
+
+    /**
+     * Resets user-specific state while preserving server configuration.
+     *
+     * Called on logout to clear all user-specific state while keeping
+     * server configuration fields that don't change per-user.
+     *
+     * Note: We intentionally preserve server config fields (authentication,
+     * ui, legal, features, regions, secret_options, diagnostics) because:
+     * 1. They're set by the server at startup and don't vary by user
+     * 2. Resetting them would temporarily show permissive defaults
+     * 3. They get re-hydrated on full page reload anyway
+     *
+     * The domain identity fields (canonical_domain, site_host, link_domains,
+     * custom_domains, display_domain) are deliberately NOT preserved. They are
+     * restored to schema defaults by $reset() — '' for the string fields, []
+     * for link_domains (#4063) — which keeps link_domains symmetric with
+     * canonical_domain. That symmetry is load-bearing: useDomainContext treats
+     * an empty link pool as "stale payload" and falls back to
+     * [canonical_domain], so preserving one without the other would produce a
+     * picker offering operator domains with no canonical fallback behind them.
+     * link_domains is a declared schema key precisely so this reset is
+     * explicit rather than a silent strip of an untyped field.
+     */
+    resetForLogout(): void {
+      // Capture current server config values before reset
+      const preservedConfig = {
+        api: this.api,
+        authentication: this.authentication,
+        ui: this.ui,
+        legal: this.legal,
+        features: this.features,
+        regions: this.regions,
+        secret_options: this.secret_options,
+        diagnostics: this.diagnostics,
+        disabled_homepage: this.disabled_homepage,
+      };
+
+      // Use built-in $reset to restore all state to DEFAULTS
+      this.$reset();
+
+      // Restore server config fields and _initialized flag
+      // Use functional $patch to avoid _DeepPartial type issues
+      this.$patch((state) => {
+        state.api = preservedConfig.api;
+        state.authentication = preservedConfig.authentication;
+        state.ui = preservedConfig.ui;
+        state.legal = preservedConfig.legal;
+        state.features = preservedConfig.features;
+        state.regions = preservedConfig.regions;
+        state.secret_options = preservedConfig.secret_options;
+        state.diagnostics = preservedConfig.diagnostics;
+        state.disabled_homepage = preservedConfig.disabled_homepage;
+        state._initialized = true;
+      });
+
+      // Evict the reference from the PRE-PINIA snapshot as well.
+      //
+      // $reset() above clears `state.diagnostics_ref`, but the store is only
+      // one of the two places the block lives: bootstrap.service holds a
+      // separate snapshot that `getBootstrapValue('diagnostics_ref')` reads,
+      // and `updateBootstrapSnapshot` cannot express a removal (it skips
+      // undefined by design). Without this call the previous reference stays
+      // READABLE there after a soft/SPA logout — the exact stale-reference
+      // condition `clearBootstrapSnapshotKey` was written to prevent, and the
+      // one update() already guards on the account-change path.
+      //
+      // Today the snapshot is re-read only by `resolveDiagnosticsRef()` at
+      // boot, so the leak is latent rather than live; it becomes live the
+      // moment any code re-resolves the ref without a page load. Clearing it
+      // here — in the store that owns the mirror — covers every caller of
+      // resetForLogout rather than the one in authStore.logout().
+      clearBootstrapSnapshotKey('diagnostics_ref');
+
+      console.debug('[BootstrapStore.resetForLogout] Reset to defaults (server config preserved)');
+    },
+  },
+});

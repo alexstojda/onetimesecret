@@ -1,0 +1,25 @@
+# apps/web/auth/operations.rb
+#
+# frozen_string_literal: true
+
+require_relative 'operations/sync_session'
+require_relative 'operations/update_password_metadata'
+require_relative 'operations/create_customer'
+require_relative 'operations/create_default_workspace'
+require_relative 'operations/join_domain_organization'
+require_relative 'operations/accept_invitation'
+require_relative 'operations/close_account'
+require_relative 'operations/delete_customer'
+require_relative 'operations/set_customer_verification'
+require_relative 'operations/disable_mfa'
+require_relative 'operations/detect_mfa_requirement'
+require_relative 'operations/mfa_state_checker'
+require_relative 'operations/bind_sso_identity'
+require_relative 'operations/confirm_sso_link'
+require_relative 'operations/deferred_sso_bind'
+require_relative 'operations/prepare_mfa_session'
+require_relative 'operations/migrate_password_from_redis'
+require_relative 'operations/resolve_login_location'
+
+# Customer admin verbs (colonel API + CLI single implementation, epic #20)
+require_relative 'operations/customers'

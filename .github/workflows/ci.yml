@@ -1,0 +1,1034 @@
+# .github/workflows/ci.yml
+---
+name: CI
+
+# Main CI workflow that runs Ruby tests using RSpec and tryouts, plus TypeScript
+# tests using Vitest and validation steps (linting, type-checking).
+#
+# Architecture (Phase 6 - Test Lanes):
+# - Tier 0: Path filtering to skip irrelevant jobs
+# - Tier 1: Lint jobs + build-assets (parallel, fast feedback)
+# - Tier 2: Unit tests (ruby-unit, typescript-unit)
+# - Tier 3: Integration tests (parallel: simple, API contract, full, disabled)
+# - Tier 4: Container validation uses pre-built assets
+#
+# Ruby test jobs run through tests/lanes/run — the same entry point as local
+# development (tests/lanes/README.md). Services come from compose.test.yml
+# (single source of truth for test service images and 21xx host ports); each
+# job starts only the services its lane needs. The lane owns environment and
+# task list; the workflow owns gating, parallelism, and reporting.
+#
+# Composite Actions:
+# - setup-ruby-test-env: Ruby environment, artifacts, config, secrets
+# - setup-node-env: Node.js, pnpm, caching
+# - run-test-lane: Lane execution + failure-tail PR comments + job summary
+#
+# Path Filtering:
+# - Ruby-only changes skip TypeScript jobs
+# - TypeScript-only changes skip Ruby jobs
+# - Workflow file changes (.github/**) run all jobs
+# - Use [ci-all] in commit message to force all jobs
+# - Use [ci-skip] in commit message to skip CI entirely
+#
+# Debug Logging (Repository Variables):
+# - ACTIONS_STEP_DEBUG=true    Enable purple debug output for all steps
+# - ACTIONS_RUNNER_DEBUG=true  Enable runner diagnostic logging
+# - Set in Settings → Secrets and variables → Actions → Variables
+#
+# Checkout Behavior by Event:
+# - pull_request: checks out refs/pull/<PR#>/merge, a synthetic merge commit
+#   of the PR branch into the base branch. Tests run against the merged result,
+#   so divergence from base can cause unexpected behavior if branches conflict.
+# - workflow_dispatch: checks out the branch/tag selected in the UI (github.ref).
+#   No merge commit — runs against the exact branch tip.
+# - push (not used here): checks out the pushed commit (github.sha), no merge.
+
+on:
+  # Runs on synthetic merge commit (PR branch merged into base). If your branch
+  # diverges from main, CI tests the merged result — not your branch in isolation.
+  pull_request:
+    branches:
+      - main
+      - develop
+      - 'rel/*'
+      - 'fix/*'
+      - 'feature/*'
+  # Runs on exact branch tip selected in UI. No merge commit.
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        type: boolean
+        description: 'Run the build with tmate debugging enabled'
+        required: false
+        default: false
+      run_all:
+        type: boolean
+        description: 'Run all CI jobs (skip path filtering)'
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================================
+  # TIER 0: PATH FILTERING (~5s)
+  # ============================================================================
+
+  changes:
+    name: T0 · Detect Changes
+    runs-on: &runs-on ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      ruby: ${{ steps.compute.outputs.ruby }}
+      typescript: ${{ steps.compute.outputs.typescript }}
+      frontend: ${{ steps.compute.outputs.frontend }}
+      oci: ${{ steps.compute.outputs.oci }}
+      ga_workflow_files: ${{ steps.compute.outputs.ga_workflow_files }}
+    steps:
+      - &checkout-step
+        name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Check for CI flags
+        id: check-flags
+        run: |
+          DISPATCH_RUN_ALL="${{ github.event_name == 'workflow_dispatch' && inputs.run_all == true }}"
+          ./.github/scripts/detect-ci-flags.sh "$DISPATCH_RUN_ALL"
+
+      - name: Detect file changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            ruby:
+              - '**/*.rb'
+              - 'Gemfile'
+              - 'Gemfile.lock'
+              - '.rubocop.yml'
+              - '.rubocop_todo.yml'
+              - '.ruby-version'
+              - '.rspec'
+              - 'spec/**'
+              - 'try/**'
+              - 'apps/**'
+              - 'lib/**'
+              - 'bin/**'
+              - 'config.ru'
+            typescript:
+              - 'src/**/*.ts'
+              - 'src/**/*.vue'
+              - 'src/**/*.tsx'
+              - 'src/**/*.js'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'tsconfig.json'
+              - 'tsconfig.*.json'
+              - 'vite.config.ts'
+              - 'vitest.config.ts'
+              - 'eslint.config.ts'
+              - '.eslintrc*'
+              - '.nvmrc'
+              - '.node-version'
+              - 'tests/**'
+              # The i18n-validate job runs the locales/scripts tests; trigger it
+              # on changes to those scripts. Edits to the pin-bearing derive
+              # workflows are covered separately — any .github/** change forces
+              # every path-filter output true (see compute-path-filter-outputs.sh),
+              # so a gate pin rename always runs this job.
+              - 'locales/scripts/**'
+            frontend:
+              - 'src/**'
+              - 'public/**'
+              - 'scripts/branding/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'vite.config.ts'
+              - 'postcss.config.*'
+            oci:
+              - 'Dockerfile*'
+              - 'docker/**'
+              - 'scripts/entrypoint.sh'
+              - 'etc/**'
+              - 'config.ru'
+            ga_workflow_files:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+
+      - name: Compute final outputs
+        id: compute
+        env:
+          SKIP_CI: ${{ steps.check-flags.outputs.skip_ci }}
+          RUN_ALL: ${{ steps.check-flags.outputs.run_all }}
+          GA_WORKFLOWS: ${{ steps.filter.outputs.ga_workflow_files }}
+          FILTER_RUBY: ${{ steps.filter.outputs.ruby }}
+          FILTER_TYPESCRIPT: ${{ steps.filter.outputs.typescript }}
+          FILTER_FRONTEND: ${{ steps.filter.outputs.frontend }}
+          FILTER_OCI: ${{ steps.filter.outputs.oci }}
+        run: ./.github/scripts/compute-path-filter-outputs.sh
+
+      - name: Generate job summary
+        run: |
+          echo "## Path Filter Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Final |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby | ${{ steps.compute.outputs.ruby }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript | ${{ steps.compute.outputs.typescript }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | ${{ steps.compute.outputs.frontend }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OCI | ${{ steps.compute.outputs.oci }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # TIER 1: LINT & BUILD JOBS (~2 min)
+  # ============================================================================
+
+  ruby-lint:
+    name: T1 · Ruby Lint
+    timeout-minutes: 5
+    runs-on: *runs-on
+    needs: [changes]
+    if: needs.changes.outputs.ruby == 'true'
+    steps:
+      - *checkout-step
+
+      - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
+        with:
+          ruby-version-file: '.ruby-version'
+          bundler-cache: false # DEBUG: disabled to rule out stale cache
+
+      - name: Install dependencies
+        run: bundle install --jobs 4 --retry 3
+
+      - name: Run Rubocop
+        run: |
+          mkdir -p tmp
+          bundle exec rubocop --config .rubocop.yml \
+            --format progress \
+            --format json --out tmp/rubocop_results.json \
+            --fail-level warning
+
+      - name: Upload Rubocop results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rubocop-results
+          path: tmp/rubocop_results.json
+          retention-days: 7
+
+  typescript-lint:
+    name: T1 · TypeScript Lint
+    timeout-minutes: 5
+    runs-on: *runs-on
+    needs: [changes]
+    if: needs.changes.outputs.typescript == 'true'
+    steps:
+      - *checkout-step
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      - name: Run type checking
+        run: pnpm type-check
+
+      - name: Run linting
+        run: pnpm lint
+
+  # Runs the pre-commit hygiene hooks (whitespace, EOF, private-key,
+  # merge-conflict, large-file) that no other CI job covers — a safety net for
+  # commits pushed with `--no-verify` or without hooks installed. Scoped to the
+  # PR diff (base..head), NOT --all-files, so pre-existing debt in untouched
+  # files never fails the job. ESLint/RuboCop are skipped here (the T1 lint jobs
+  # own them); no-commit-to-branch is a local-only guard.
+  hygiene:
+    name: T1 · Hygiene (pre-commit)
+    timeout-minutes: 3
+    runs-on: *runs-on
+    # Hygiene isn't path-gated (applies to any file type), but needs a PR diff to
+    # scope to — workflow_dispatch has none, so restrict to pull_request.
+    if: github.event_name == 'pull_request'
+    steps:
+      # fetch-depth: 0 — pre-commit's --from-ref/--to-ref needs both the base and
+      # head commits present; the default shallow checkout lacks the base.
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run hygiene hooks on the PR diff
+        # SHAs are GitHub-computed hex (not injectable like head.ref/titles), but
+        # routed through env per workflow-injection best practice all the same.
+        env:
+          SKIP: eslint-staged,rubocop,no-commit-to-branch
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pipx run pre-commit run \
+            --from-ref "$BASE_SHA" \
+            --to-ref "$HEAD_SHA" \
+            --show-diff-on-failure
+
+  i18n-validate:
+    name: T1 · i18n Validation
+    timeout-minutes: 2
+    runs-on: *runs-on
+    needs: [changes]
+    if: needs.changes.outputs.typescript == 'true'
+    steps:
+      - *checkout-step
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Run variable audit
+        run: |
+          echo "## i18n Variable Audit" >> $GITHUB_STEP_SUMMARY
+          # Report-only: the handler exits with the discrepancy count (capped at
+          # 100). `|| true` would mask that count behind true's 0, so instead
+          # disable errexit around the pipeline and read PIPESTATUS[0] — the
+          # python exit, not tee's — to keep the summary accurate under pipefail.
+          set +e
+          python3 locales/scripts/i18n validate variables --summary | tee -a $GITHUB_STEP_SUMMARY
+          ISSUES=${PIPESTATUS[0]}
+          set -e
+          if [ "$ISSUES" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ Found $ISSUES variable discrepancies across locales" >> $GITHUB_STEP_SUMMARY
+          fi
+          # Don't fail build - report only (remove 'exit 0' to enforce)
+          exit 0
+
+      # Hash-freshness gate: every en source key's content_hash must match its
+      # text (sha256[:8]). Stale hashes make staleness detection lie downstream
+      # (tasks --missing-only, export watermarks). Enforcing — repair with
+      # `python3 locales/scripts/i18n content hashes`.
+      - name: Verify en content_hash freshness
+        run: python3 locales/scripts/i18n validate hashes
+
+      # Executable invariants for the i18n CLI and the on-demand governance
+      # derive (no-vendor model, ADR-005). The derive-governance pin-contract
+      # tests guard the gate<->script link that silently broke once
+      # (PINNED_RULES_REF -> TRANSLATION_RULES_REF). Zero third-party deps.
+      - name: Run i18n script tests
+        run: python3 -m unittest discover -s locales/scripts/tests -v
+
+  build-assets:
+    name: T1 · Build Frontend Assets
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes]
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.ruby == 'true'
+    steps:
+      - *checkout-step
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      # Guard against branding asset drift: the committed neutral favicon/icon
+      # text assets must match scripts/branding/mark.mjs (the single source of
+      # truth). Node-only, no sharp install required. See
+      # docs/customization/branding-favicon.md.
+      - name: Verify branding assets are in sync
+        run: pnpm run gen:favicons:check
+
+      - name: Build assets
+        run: pnpm run build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: frontend-build
+          path: public/web/dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================================
+  # TIER 2: UNIT TESTS (~7-9 min)
+  # ============================================================================
+
+  ruby-unit:
+    name: T2 · Ruby Unit Tests
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    if: |
+      always() &&
+      needs.changes.outputs.ruby == 'true' &&
+      (needs.ruby-lint.result == 'success' || needs.ruby-lint.result == 'skipped') &&
+      (needs.build-assets.result == 'success' || needs.build-assets.result == 'skipped')
+    # pull-requests: write lets run-test-lane post failure tails as PR
+    # comments. contents: read inherited from workflow-level permissions.
+    permissions:
+      contents: read
+      pull-requests: write
+      # Required to upload coverage data to GitHub Code Quality.
+      code-quality: write
+
+    steps:
+      # Check out the PR head commit (not the merge commit) so coverage line
+      # numbers map correctly to the diff for GitHub Code Quality.
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # Services come from compose.test.yml (the single source of truth for
+      # test service images and 21xx host ports) — the same containers a local
+      # `tests/lanes/run` uses. Start only what this job's lane needs.
+      - &start-core-services
+        name: Start test services (valkey, rabbitmq)
+        run: docker compose -f compose.test.yml up --wait -d valkey rabbitmq
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      # Diagnostic probe for CI-only hash mismatch (issue being investigated).
+      # A CI-layer concern, not part of the lane contract — env mirrors the
+      # unit lane (tests/lanes/base.env + unit/env). Non-blocking (|| true).
+      - name: Run hash-mismatch diagnostic probe
+        env:
+          REDIS_URL: 'redis://127.0.0.1:2163/0'
+          RABBITMQ_URL: 'amqp://guest:guest@127.0.0.1:2156'
+          RACK_ENV: 'test'
+          AUTHENTICATION_MODE: 'simple'
+          BILLING_ENABLED: 'false'
+          DEBUG_DATABASE: 'true'
+          DEBUG_LOGGERS: 'Familia:trace'
+        run: |
+          echo "::group::Hash-mismatch diagnostic probe"
+          if [ -f "try/unit/billing/hash_mismatch_probe.rb" ]; then
+            bundle exec ruby try/unit/billing/hash_mismatch_probe.rb 2>&1 || true
+          else
+            echo "Probe file not found, skipping"
+          fi
+          echo "::endgroup::"
+
+      # Enable SimpleCov for the test run below. COVERAGE reaches the lane's
+      # `rake spec:fast` process only because it is one of the six names on
+      # the keep-list in tests/lanes/run — the runner clears every exported
+      # variable except PATH, HOME, CI, LANES_NO_AUTOSTART, RSPEC_OUTPUT_FILE
+      # and COVERAGE before it loads the lane env. Do not copy this pattern
+      # for a new variable: writing it to GITHUB_ENV is not enough, the scrub
+      # discards it silently and the test process never sees it. A new
+      # variable belongs in tests/lanes/base.env (every lane) or the lane's
+      # own env file (one lane); the keep-list is for CI plumbing that cannot
+      # live in those files, and growing it is a reviewed exception each time.
+      - name: Enable coverage
+        run: echo "COVERAGE=true" >> "$GITHUB_ENV"
+
+      - name: Run unit lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: unit
+          results-file: 'rspec_unit_results.json'
+          debug-enabled: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
+
+      # Uploads coverage/coverage.xml (Cobertura) to GitHub Code Quality.
+      # Skipped on forked PRs, which cannot write Code Quality data.
+      - name: Upload coverage report
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34 # v1.4.2
+        with:
+          file: coverage/coverage.xml
+          language: Ruby
+          label: code-coverage/rspec
+
+  typescript-unit:
+    name: T2 · TypeScript Unit Tests
+    timeout-minutes: 15
+    runs-on: *runs-on
+    needs: [changes, typescript-lint]
+    if: |
+      always() &&
+      needs.changes.outputs.typescript == 'true' &&
+      (needs.typescript-lint.result == 'success' || needs.typescript-lint.result == 'skipped')
+    permissions:
+      contents: read
+      # Required to upload coverage data to GitHub Code Quality.
+      code-quality: write
+    steps:
+      # Check out the PR head commit (not the merge commit) so coverage line
+      # numbers map correctly to the diff for GitHub Code Quality.
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Generate locale files
+        run: pnpm run locales:sync
+
+      - name: Run TypeScript tests with coverage
+        run: pnpm test:base run --coverage --printConsoleTrace
+
+      # Uploads coverage/cobertura-coverage.xml (Cobertura) to Code Quality.
+      # Skipped on forked PRs, which cannot write Code Quality data.
+      - name: Upload coverage report
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-code-coverage@d8e329117199404bba6fc81efe8093dc7c015e34 # v1.4.2
+        with:
+          file: coverage/cobertura-coverage.xml
+          language: TypeScript
+          label: code-coverage/vitest
+
+      - name: Run type checking tests
+        continue-on-error: false
+        run: pnpm type-check:tests
+
+  # ============================================================================
+  # TIER 3: INTEGRATION TESTS (~4-6 min each, run in parallel)
+  # ============================================================================
+
+  smoke-test:
+    name: T3 · Smoke Test
+    timeout-minutes: 15
+    runs-on: *runs-on
+    needs: [changes, build-assets, ruby-unit, typescript-unit]
+    if: |
+      always() &&
+      needs.changes.outputs.ruby == 'true' &&
+      needs.changes.outputs.typescript == 'true' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    steps:
+      - *checkout-step
+
+      # valkey + rabbitmq, not valkey alone: base.env carries RABBITMQ_URL
+      # for every lane and the lane runner's preflight requires every
+      # endpoint in the lane's env to be reachable.
+      - *start-core-services
+
+      - name: Setup Node.js environment
+        uses: ./.github/actions/setup-node-env
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Run smoke lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: smoke
+
+  ruby-integration-simple:
+    name: T3 · Ruby Integration (Simple Mode)
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    # T3 no longer waits on ruby-unit. That edge was a policy gate ("don't
+    # spend integration minutes until the units are green"), never a data
+    # dependency — nothing here consumes a ruby-unit artifact, and the real
+    # prerequisites are the ones these lanes read: rubocop's verdict and the
+    # frontend build that setup-ruby-test-env restores. cancel-in-progress
+    # (see `concurrency` at the top of this file) already bounds the compute
+    # a red unit run can waste, so T2 and T3 now start together.
+    #
+    # Single anchor, aliased by ruby-integration-full and
+    # ruby-integration-disabled, so the three T3 jobs cannot drift apart.
+    # Per-prerequisite success-or-skipped tests, NOT a blanket
+    # !contains(needs.*.result, 'failure'): the blanket form would also gate
+    # on jobs added to `needs` later for ordering reasons only.
+    if: &if-ruby-integration |
+      always() &&
+      needs.changes.outputs.ruby == 'true' &&
+      (needs.ruby-lint.result == 'success' || needs.ruby-lint.result == 'skipped') &&
+      (needs.build-assets.result == 'success' || needs.build-assets.result == 'skipped') &&
+      !contains(needs.*.result, 'cancelled')
+    permissions: &perms-pr-comment
+      contents: read
+      pull-requests: write
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Run simple lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: simple
+          results-file: 'rspec_simple_results.json'
+
+  ruby-integration-api:
+    name: T3 · Ruby Integration (API Contract)
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    if: *if-ruby-integration
+    permissions: *perms-pr-comment
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      # API contract specs (spec/api/) are a different axis than auth mode.
+      # This was continue-on-error while the #3225 / ADR-012 Stage 3
+      # membership-contract drift was repaired. It is now blocking and runs
+      # independently so it can execute alongside simple mode.
+      - name: Run api lane (spec/api)
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: api
+          results-file: 'rspec_api_results.json'
+
+  ruby-integration-full:
+    name: 'T3 · Ruby Integration (Full, ${{ matrix.name }})'
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    if: *if-ruby-integration
+    permissions: *perms-pr-comment
+
+    # Auth-mode, database engine, and endpoints live in the lane env files
+    # (tests/lanes/<lane>/env); billing rows are the same lanes with the
+    # billing overlay. The matrix only picks lane, overlay, and services.
+    # PG roles come from compose.test.yml's initdb mount (first boot), so
+    # there is no separate psql setup step.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'SQLite, billing: off'
+            lane: full-sqlite
+            overlay: ''
+            services: 'valkey rabbitmq'
+            results-file: 'rspec_full_sqlite_billing_off_results.json'
+          - name: 'SQLite, billing: on'
+            lane: full-sqlite
+            overlay: 'billing'
+            services: 'valkey rabbitmq'
+            results-file: 'rspec_full_sqlite_billing_on_results.json'
+          - name: 'PG, billing: off'
+            lane: full-pg
+            overlay: ''
+            services: 'valkey rabbitmq postgres'
+            results-file: 'rspec_full_postgres_billing_off_results.json'
+          - name: 'PG, billing: on'
+            lane: full-pg
+            overlay: 'billing'
+            services: 'valkey rabbitmq postgres'
+            results-file: 'rspec_full_postgres_billing_on_results.json'
+          - name: 'PG agnostic, billing: off'
+            lane: full-pg-agnostic
+            overlay: ''
+            services: 'valkey rabbitmq postgres'
+            results-file: 'rspec_full_pg_agnostic_billing_off_results.json'
+          - name: 'PG agnostic, billing: on'
+            lane: full-pg-agnostic
+            overlay: 'billing'
+            services: 'valkey rabbitmq postgres'
+            results-file: 'rspec_full_pg_agnostic_billing_on_results.json'
+
+    steps:
+      - *checkout-step
+
+      - name: Start test services
+        env:
+          SERVICES: ${{ matrix.services }}
+        # SERVICES is a space-separated service list; word splitting intended.
+        run: docker compose -f compose.test.yml up --wait -d $SERVICES
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Run lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: ${{ matrix.lane }}
+          overlay: ${{ matrix.overlay }}
+          results-file: ${{ matrix.results-file }}
+
+  ruby-integration-disabled:
+    name: T3 · Ruby Integration (Disabled Mode)
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    if: *if-ruby-integration
+    permissions: *perms-pr-comment
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Run disabled lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: disabled
+          results-file: 'rspec_disabled_results.json'
+
+  ruby-integration-strategies:
+    name: T3 · Ruby Integration (Strategies, isolated)
+    timeout-minutes: 10
+    runs-on: *runs-on
+    needs: [changes, ruby-lint, build-assets]
+    if: *if-ruby-integration
+    permissions: *perms-pr-comment
+
+    steps:
+      - *checkout-step
+
+      - *start-core-services
+
+      - name: Setup Ruby test environment
+        uses: ./.github/actions/setup-ruby-test-env
+
+      - name: Setup Python for locale sync
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Setup Node.js for locale sync
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: '.node-version'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      # Redis-only auth strategy specs, isolated from the spec:integration:full
+      # process whose spec/integration/all RabbitMQ/fork specs corrupt the
+      # shared Familia/Redis connection (see #3468). Full mode + in-memory
+      # SQLite mirrors their verified-green environment; they issue no SQL.
+      - name: Run strategies lane
+        uses: ./.github/actions/run-test-lane
+        with:
+          lane: strategies
+          results-file: 'rspec_strategies_results.json'
+
+  # ============================================================================
+  # TIER 4: CONTAINER VALIDATION (~3 min, after Tier 3)
+  # ============================================================================
+
+  check-oci-image:
+    name: T4 · Container Validation
+    timeout-minutes: 10
+    runs-on: *runs-on
+    # build-assets is an OPTIMIZATION dependency, not a correctness one: this
+    # job builds the frontend inline (see "Build frontend assets inline"
+    # below) whenever the frontend-build artifact is missing, so waiting for
+    # build-assets only avoids paying that build twice. It used to wait on
+    # the three T3 integration jobs and typescript-unit instead; that was
+    # never a real prerequisite — container validation asserts the image
+    # BOOTS and serves /, which no integration result predicts. Gating it on
+    # T3 just pushed the slowest signal to the end of the run.
+    needs: [changes, build-assets]
+    if: |
+      always() &&
+      (needs.changes.outputs.oci == 'true' || needs.changes.outputs.frontend == 'true') &&
+      (needs.build-assets.result == 'success' || needs.build-assets.result == 'skipped') &&
+      !contains(needs.*.result, 'cancelled')
+
+    # Deliberately a services: block, not compose.test.yml: the container
+    # under test reaches valkey via host.docker.internal, which needs the
+    # port published on all interfaces — compose.test.yml binds 127.0.0.1
+    # only (tests/lanes/README.md port isolation). Image digest matches
+    # compose.test.yml; update both together.
+    services:
+      redis:
+        image: ghcr.io/valkey-io/valkey:8.1.3-bookworm@sha256:fea8b3e67b15729d4bb70589eb03367bab9ad1ee89c876f54327fc7c6e618571
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 5
+          --memory=4g
+        ports:
+          - 2163:6379
+
+    steps:
+      - *checkout-step
+
+      - name: Download frontend assets
+        id: download-assets
+        uses: ./.github/actions/download-frontend-assets
+        continue-on-error: true
+
+      # Build assets inline if artifact doesn't exist (OCI-only changes)
+      - name: Setup Node.js for inline build
+        if: steps.download-assets.outcome == 'failure'
+        uses: ./.github/actions/setup-node-env
+
+      - name: Build frontend assets inline
+        if: steps.download-assets.outcome == 'failure'
+        run: pnpm run build
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build Container image
+        uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: . # Use local checkout instead of fetching git URL (avoids PR merge ref issues)
+          files: docker/bake.hcl
+          targets: main
+          load: true
+          set: |
+            main.tags=onetime-test
+            main.args.ALLOW_DEV_VERSION=true
+
+      - name: Generate random secrets for container
+        uses: ./.github/actions/generate-test-secrets
+
+      - name: Test container
+        uses: ./.github/actions/test-docker-container
+        with:
+          image-name: 'onetime-test'
+          container-name: 'onetime-test-container'
+          port: '3000'
+          redis-url: 'redis://host.docker.internal:2163/0'
+          environment-vars: |
+            SESSION_SECRET=${{ env.SESSION_SECRET }}
+            AUTH_SECRET=${{ env.AUTH_SECRET }}
+            ARGON2_SECRET=${{ env.ARGON2_SECRET }}
+            FEDERATION_SECRET=${{ env.FEDERATION_SECRET }}
+            IDENTIFIER_SECRET=${{ env.IDENTIFIER_SECRET }}
+            SECRET=${{ env.SECRET }}
+          test-endpoints: |
+            /
+          max-wait-attempts: '30'
+          wait-interval: '2'
+
+  # ============================================================================
+  # TIER 5: TEST AGGREGATION & CI METRICS (runs last)
+  # ============================================================================
+
+  aggregate-test-results:
+    name: T5 · Aggregate Test Results
+    runs-on: *runs-on
+    timeout-minutes: 5
+    needs:
+      - ruby-unit
+      - ruby-integration-simple
+      - ruby-integration-api
+      - ruby-integration-full
+      - ruby-integration-disabled
+      - ruby-integration-strategies
+      - typescript-unit
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # 'rspec-*-results', not '*-results': the aggregation script's find
+      # matches *_results.json, so the looser pattern also swept in
+      # rubocop-results/rubocop_results.json — a file with no
+      # .summary.example_count, which jq folded in as a zero-example suite.
+      # Only run-test-lane publishes artifacts under the rspec- prefix.
+      - name: Download all test result artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: 'rspec-*-results'
+          path: test-results/
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "::group::Downloaded test results"
+          if [ -d "test-results" ]; then
+            find test-results -type f -name "*.json" | head -20
+          else
+            echo "No test-results directory found"
+          fi
+          echo "::endgroup::"
+
+      - name: Generate unified test report
+        id: aggregate
+        run: ./.github/scripts/aggregate-test-results.sh test-results
+
+      - name: Generate job summary
+        if: always()
+        run: ./.github/scripts/generate-test-summary.sh test-results/unified-report.json
+
+      - name: Upload unified test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unified-test-report
+          path: test-results/unified-report.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  ci-metrics:
+    name: T5 · CI Metrics
+    runs-on: *runs-on
+    timeout-minutes: 2
+    # List ALL jobs to ensure this runs last (after all complete/skip/fail)
+    needs:
+      - changes
+      - ruby-lint
+      - typescript-lint
+      - i18n-validate
+      - build-assets
+      - ruby-unit
+      - typescript-unit
+      - ruby-integration-simple
+      - ruby-integration-api
+      - ruby-integration-full
+      - ruby-integration-disabled
+      - ruby-integration-strategies
+      - smoke-test
+      - check-oci-image
+      - aggregate-test-results
+    # always() ensures this runs even if some jobs failed/skipped
+    if: always()
+    # Permissions for posting PR comments
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - *checkout-step
+
+      - name: Check CI metrics
+        id: metrics
+        uses: ./.github/actions/check-ci-metrics
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Report job outcomes
+        run: |
+          echo "## Job Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Detect Changes | ${{ needs.changes.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Lint | ${{ needs.ruby-lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript Lint | ${{ needs.typescript-lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| i18n Validation | ${{ needs.i18n-validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Assets | ${{ needs.build-assets.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Unit | ${{ needs.ruby-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript Unit | ${{ needs.typescript-unit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Integration (Simple) | ${{ needs.ruby-integration-simple.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Integration (API Contract) | ${{ needs.ruby-integration-api.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Integration (Full matrix) | ${{ needs.ruby-integration-full.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Integration (Disabled) | ${{ needs.ruby-integration-disabled.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ruby Integration (Strategies) | ${{ needs.ruby-integration-strategies.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Container Validation | ${{ needs.check-oci-image.result }} |" >> $GITHUB_STEP_SUMMARY
+
+      # Post CI metrics summary as PR comment (PRs only, skip forks - no write access)
+      - name: Post metrics to PR
+        if: github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const script = require('./.github/scripts/post-pr-metrics.cjs');
+            await script({
+              github,
+              context,
+              core,
+              tierData: {
+                tier1Seconds: '${{ steps.metrics.outputs.tier1-seconds }}',
+                tier2Seconds: '${{ steps.metrics.outputs.tier2-seconds }}',
+                tier3Seconds: '${{ steps.metrics.outputs.tier3-seconds }}',
+                tier4Seconds: '${{ steps.metrics.outputs.tier4-seconds }}',
+                tier1Target: 60,
+                tier2Target: 120,
+                tier3Target: 210,
+                tier4Target: 400,
+              },
+            });
